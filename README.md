@@ -97,14 +97,18 @@ to. What the presets produce:
 
 | Preset | Peak power | Peak torque |
 | --- | --- | --- |
-| Stock 2.0 inline-4 | 94 kW at 6100 | 192 N m at 3500 |
-| Turbo 2.0 inline-4 | 190 kW at 5600 | 399 N m at 2800 |
-| Crossplane 5.0 V8 | 240 kW at 6200 | 492 N m at 3300 |
-| Flat-plane 4.5 V8 | 310 kW at 7800 | 446 N m at 3500 |
-| Race 6.0 V12 | 445 kW at 8400 | 588 N m at 3400 |
-| Blown methanol 7.0 V8 | 785 kW at 5200 | 1780 N m at 2500 |
-| 3.0 inline-6 turbo diesel | 174 kW at 4600 | 445 N m at 2000 |
-| 600cc inline-4 superbike | 80 kW at 14400 | 62 N m at 11200 |
+| Stock 2.0 inline-4 | 86 kW at 5600 | 192 N m at 3000 |
+| Turbo 2.0 inline-4 | 185 kW at 5600 | 392 N m at 2400 |
+| Crossplane 5.0 V8 | 222 kW at 5700 | 495 N m at 3300 |
+| Flat-plane 4.5 V8 | 284 kW at 7300 | 448 N m at 3200 |
+| Race 6.0 V12 | 391 kW at 7900 | 552 N m at 3500 |
+| Blown methanol 7.0 V8 | 607 kW at 4800 | 1524 N m at 2100 |
+| 3.0 inline-6 turbo diesel | 184 kW at 4600 | 471 N m at 1700 |
+| 600cc inline-4 superbike | 70 kW at 14400 | 58 N m at 10100 |
+
+The drivetrain tab also reports the **drag-limited top speed**, so the per-gear
+speeds at the limiter can be read for what they are. A top gear taller than the
+drag limit is an overdrive, not more speed.
 
 ## How it works
 
@@ -139,9 +143,17 @@ combustion products), integrated in crank angle:
   that every runner feeds and which vents to atmosphere, so back pressure and
   residual gas are simulated rather than assumed.
 - **Control**: spark advance and lambda follow small maps against speed and
-  load, retarded by boost and by the knock sensor, and a PID idle-air valve
-  with an anti-stall dashpot holds the idle, the way an ECU does. Without the
-  derivative term the idle limit-cycles.
+  load, retarded by boost and by the knock sensor. Idle is held by two loops the
+  way a real ECU holds it: the air valve carries the steady state, and a spark
+  trim carries the fast correction, because torque follows timing within one
+  firing where it takes several cycles to follow the manifold. Running both
+  hard makes them fight and the engine hunts; the trim also stands down below
+  half idle speed, since advancing the spark at cranking speed makes an engine
+  fight itself and never catch.
+- A long-overlap cam **cannot idle slowly** - so much of what it draws in goes
+  straight out of the exhaust that what is left will barely burn - so the
+  minimum idle speed a design will accept moves with the overlap its cam
+  actually has. A 280 degree race cam idles near 1900 rpm and lopes even there.
 
 Crank dynamics are `I dw/dt = tau_gas + tau_recip - tau_friction - tau_load`.
 Reciprocating piston inertia gives the crank its within-cycle speed ripple, and
@@ -157,18 +169,37 @@ its flame moves, and how hard it is to detonate. Those drive everything:
 - **Charge cooling** is applied in the runner, where a port injector actually
   evaporates. On petrol it is worth a few degrees. On methanol it is worth over
   a hundred, and that density gain is most of why alcohol makes power.
+- **Heat release is limited by oxygen, not by fuel.** Below stoichiometric
+  there is not enough air to burn everything injected, and the excess leaves as
+  carbon monoxide. Releasing it anyway is a classic way to make a rich full-load
+  mixture produce more heat than the air could ever supply - too much peak
+  pressure, knock everywhere, and exhaust temperatures hundreds of degrees above
+  anything real.
 - **Knock** uses the Douaud-Eyzat induction time integrated Livengood-Wu style
   over the unburned gas, whose temperature is tracked by isentropic compression
-  from the state at intake valve closing. When the integral reaches one before
-  the flame arrives, the end gas lights on its own: the remaining charge goes
-  off in one step, the pressure spikes, heat loss to the walls jumps, and you
-  hear it. Knock resistance is a bowl in lambda, worst just lean of
+  from the state at intake valve closing. The integral stops once the flame has
+  crossed most of the chamber, because past that there is no end gas left to
+  detonate. When it reaches one first, the end gas lights on its own: the
+  remaining charge goes off in one step, the pressure spikes, heat loss to the
+  walls jumps, and you hear it. The calibration is set so a stock 10.5:1 engine
+  on 95 RON is knock-limited around 30 degrees of advance, which is where a real
+  one is - so knock is a consequence of what you build, not a constant. Knock resistance is a bowl in lambda, worst just lean of
   stoichiometric — enrichment and genuine lean-burn both move away from it.
   With knock control on, the ECU pulls timing fast and gives it back slowly.
 - **Compression ignition** is a different engine, not a switch: no throttle
   plate, no spark, the pedal meters fuel against a smoke limit, ignition delay
   falls as the charge gets hotter (which is why a cold one rattles), and the
   diffusion burn is longer than a premixed flame.
+
+### Exhaust temperature
+
+The pipes are radiators, and each has a wall temperature of its own: heated by
+the gas going past, cooled to the air by convection and - once it glows - mostly
+by radiation, which is the term that pins a manifold near 800 C at full load
+however hard you drive it. Steel this thin carries about half a minute of
+thermal lag, so a cold pipe at light load reads properly cool and comes up as
+you use it. Without the wall the gas arrives at the collector still at port
+temperature, which is hundreds of degrees above anything a real probe sees.
 
 ### Forced induction
 
@@ -297,7 +328,9 @@ waveform.
 - The gas dynamics run one exhaust collector regardless of layout; the split
   into per-bank collectors exists only in the sound synthesis.
 - No blowby and no crevice volumes; Woschni carries a calibration multiplier to
-  stand in for what those would remove.
+  stand in for what those would remove, as does the knock induction time.
+- No dissociation at peak temperature, so the model slightly over-values a
+  stoichiometric mixture against a rich one.
 - No thermal model of the block: wall temperature is a constant, so the oil
   warms up but there is no cold-start enrichment.
 - No tyre model: wheel torque becomes acceleration directly, so first gear has

@@ -8,6 +8,8 @@ namespace {
 
 constexpr double kPi     = 3.14159265358979323846;
 constexpr double kDegRad = kPi / 180.0;
+// Ambient to the fourth, for the radiation term in the exhaust wall balance.
+constexpr double kAmbient4 = Thermo::tAmb * Thermo::tAmb * Thermo::tAmb * Thermo::tAmb;
 
 double wrap720(double a) {
     a = std::fmod(a, 720.0);
@@ -138,6 +140,14 @@ void Engine::rebuild(bool preserveMotion) {
 
     const double runnerVol   = m_p.intakeRunner.length * m_p.intakeRunner.area;
     const double exRunnerVol = m_p.exhaustRunner.length * m_p.exhaustRunner.area;
+
+    // Wetted area of the exhaust, for the wall heat transfer. The primary is a
+    // pipe of the runner's own cross-section; the collector is taken as a can
+    // three times as long as it is wide, which is what most of them are.
+    const double exDia = std::sqrt(4.0 * m_p.exhaustRunner.area / kPi);
+    m_exRunnerWallArea = kPi * exDia * m_p.exhaustRunner.length;
+    const double colDia = std::cbrt(4.0 * m_p.collectorVolume / (3.0 * kPi));
+    m_collectorWallArea = 3.0 * kPi * colDia * colDia;
 
     if (!preserveMotion) {
         m_crankAngle = 0.0;
@@ -365,6 +375,31 @@ void Engine::step(double dt) {
         return dm;
     };
 
+    // ---- Exhaust pipe heat loss --------------------------------------------
+    // An exhaust manifold is a radiator, and a hot one is losing kilowatts.
+    // Without this the gas arrives at the collector at port temperature, which
+    // reads hundreds of degrees above anything a real probe sees; with it, a
+    // cold pipe at light load also reads properly cool, because the wall has
+    // not had time to come up.
+    //
+    // The wall settles where convection in balances convection and radiation
+    // out. Radiation is what dominates once it glows, and it is the term that
+    // pins a manifold near 800 C at full load however hard you drive it.
+    auto pipeLoss = [&](double& gasEnergy, double gasMass, double gasTemp,
+                        double& wallTemp, double area, double mdot) {
+        if (area <= 1e-9 || gasMass <= 1e-9) return;
+        const double h = 90.0 + 2400.0 * std::pow(std::abs(mdot), 0.8);
+        const double q = h * area * (gasTemp - wallTemp);
+        gasEnergy -= q * dt;
+        const double t4 = wallTemp * wallTemp * wallTemp * wallTemp;
+        const double out = 22.0 * area * (wallTemp - Thermo::tAmb) +
+                           4.54e-8 * area * (t4 - kAmbient4);
+        // Thin steel: about 5.9 kJ per square metre per kelvin, which is what
+        // gives a manifold its half-minute of thermal lag.
+        wallTemp += (q - out) / (5850.0 * area) * dt;
+        wallTemp = std::clamp(wallTemp, Thermo::tAmb, 1600.0);
+    };
+
     // ---- Ambient / compressor reservoir ------------------------------------
     double ambMass = 1.0e9, ambEnergy = 0.0, ambBurned = 0.0;
     auto ambientNode = [&](double y) {
@@ -408,10 +443,15 @@ void Engine::step(double dt) {
         // PID. The derivative term is what matters here: an idling engine is
         // almost unloaded, so a small change in air is a large change in
         // acceleration, and proportional-integral alone limit-cycles.
+        // Air is the slow half: it carries the steady state and little else.
+        // The fast proportional and derivative action lives on the spark trim
+        // below, because torque follows timing within one firing where it takes
+        // several cycles to follow the manifold. Running both loops hard makes
+        // them fight, and the engine hunts by hundreds of rpm.
         const double err  = (m_p.idleTargetRpm - m_rpmFilt) / m_p.idleTargetRpm;
         const double derr = -m_rpmRate / m_p.idleTargetRpm;
-        m_idleIntegral = std::clamp(m_idleIntegral + err * dt * 0.15, 0.0, 1.0);
-        m_idleCmd = std::clamp(m_idleIntegral + 0.7 * err + 0.8 * derr, 0.0, 1.0);
+        m_idleIntegral = std::clamp(m_idleIntegral + err * dt * 0.25, 0.0, 1.0);
+        m_idleCmd = std::clamp(m_idleIntegral + 0.35 * err + 0.25 * derr, 0.0, 1.0);
     } else {
         m_idleCmd = std::clamp(m_idleCmd - dt * 2.0, 0.0, 1.0);
         m_idleIntegral = std::clamp(m_idleIntegral, 0.25, 1.0);
@@ -493,10 +533,28 @@ void Engine::step(double dt) {
     // much closer to lighting on its own. A diesel has the opposite problem -
     // it wants its fuel in early - so this applies only where there is a spark.
     const double boostRetard = diesel ? 0.0
-        : 12.0 * std::max(0.0, m_plenumPressure / Thermo::pAmb - 1.0);
+        : 8.0 * std::max(0.0, m_plenumPressure / Thermo::pAmb - 1.0);
+    // Spark is the fast half of idle control. Air takes several cycles to
+    // arrive through the manifold; timing changes the torque of the very next
+    // firing, so a real ECU holds the base advance a little retarded at idle
+    // and trims it either way to catch a disturbance. Without it a long-duration
+    // cam - which idles on a dilute, slow-burning charge anyway - hunts by
+    // hundreds of rpm while the air loop chases it.
+    // Only once it is actually running, though. Advancing the spark at cranking
+    // speed makes the engine fight itself well before top dead centre and it
+    // will never catch - which is exactly why a real ECU cranks retarded.
+    double idleSparkTrim = 0.0;
+    if (!diesel && m_throttle < 0.02 &&
+        m_rpmFilt > m_p.idleTargetRpm * 0.55 && m_rpmFilt < m_p.idleTargetRpm * 1.8) {
+        const double err  = (m_p.idleTargetRpm - m_rpmFilt) / m_p.idleTargetRpm;
+        const double derr = m_rpmRate / m_p.idleTargetRpm;
+        idleSparkTrim = std::clamp(9.0 * err - 5.0 * derr, -8.0, 8.0);
+    }
+
     m_sparkAdvance = m_p.sparkIdle +
                      (m_p.sparkHighSpeed - m_p.sparkIdle) * speedFrac +
-                     m_p.sparkPartLoad * (1.0 - loadForMix) - m_knockRetard - boostRetard;
+                     m_p.sparkPartLoad * (1.0 - loadForMix) - m_knockRetard -
+                     boostRetard + idleSparkTrim;
     m_sparkAdvance = std::clamp(m_sparkAdvance, -10.0, 60.0);
     const double sparkPhase = wrap720(720.0 - m_sparkAdvance);
     const double a  = 0.5 * m_p.stroke;
@@ -505,7 +563,10 @@ void Engine::step(double dt) {
 
     // Fuel demand on a compression-ignition engine is the pedal itself: there
     // is no throttle, the rack just meters more fuel into the same air.
-    const double fuelDemand = std::clamp(std::max(m_throttle, m_idleCmd * 0.16), 0.0, 1.0);
+    // The governor needs enough authority to carry the engine s own friction at
+    // idle, which on a big diesel with a heavy flywheel is a good deal more fuel
+    // than a token trickle.
+    const double fuelDemand = std::clamp(std::max(m_throttle, m_idleCmd * 0.45), 0.0, 1.0);
 
     // Charge cooling. Port-injected fuel evaporates in the runner and takes its
     // latent heat out of the air going past it. On petrol this is worth a few
@@ -572,6 +633,8 @@ void Engine::step(double dt) {
         accelerate(c.exhaustFlowRate, c.exRunnerPressure, m_collectorPressure,
                    rhoEx, m_p.exhaustRunner);
         convect(exRunNode(), collector(), c.exhaustFlowRate);
+        pipeLoss(c.exRunnerEnergy, c.exRunnerMass, c.exRunnerTemp, c.exWallTemp,
+                 m_exRunnerWallArea, c.exhaustFlowRate);
 
         // Refresh the runner states before the valves see them.
         auto refreshRunner = [&] {
@@ -653,7 +716,15 @@ void Engine::step(double dt) {
                     // Only the unburned part of the charge carries fuel.
                     c.fuelMass = c.mass * (1.0 - yCyl) / std::max(m_afr, 3.0);
                 }
-                c.fuelEnergy = c.fuelMass * m_p.fuel.lhv * m_p.combustionEff * dilutionEff;
+                // Below stoichiometric there is not enough oxygen to burn all
+                // of the fuel, and what cannot burn leaves as carbon monoxide.
+                // Releasing all of it anyway is what made a rich full-load
+                // mixture produce more heat than the air could support - too
+                // much peak pressure, too much knock, and exhaust temperatures
+                // hundreds of degrees above anything real.
+                const double oxygenLimit = std::min(1.0, m_lambda);
+                c.fuelEnergy = c.fuelMass * m_p.fuel.lhv * m_p.combustionEff *
+                               dilutionEff * oxygenLimit;
                 m_fuelAccum += c.fuelMass;
             }
         }
@@ -683,7 +754,13 @@ void Engine::step(double dt) {
         // Douaud-Eyzat gives its induction time; Livengood-Wu integrates the
         // reciprocal of that time, and when the integral reaches one the end gas
         // lights on its own - all of it at once, which is the noise.
-        if (!diesel && c.burning && c.knockIntegral >= 0.0 && c.pressure > 5.0e5) {
+        // Once the flame has crossed most of the chamber there is no end gas
+        // left to detonate, and the pressure peak that follows belongs to gas
+        // that has already burned. Integrating through it was most of why this
+        // model heard knock everywhere: the largest contributions were being
+        // collected exactly where the term no longer applies.
+        if (!diesel && c.burning && c.knockIntegral >= 0.0 &&
+            c.burnFraction < 0.85 && c.pressure > 5.0e5) {
             const double tu = std::clamp(
                 c.refTemp * std::pow(c.pressure / std::max(c.refPressure, 1.0e4), 0.2857),
                 300.0, 1400.0);
@@ -696,6 +773,13 @@ void Engine::step(double dt) {
             // enough that a hydrogen or lean-burn engine barely knocks at all.
             const double dl = m_lambda - 1.05;
             tau *= std::clamp(0.90 + 6.0 * dl * dl + (dl < 0.0 ? -1.6 * dl : 0.0), 0.85, 5.0);
+            // Douaud and Eyzat fitted their correlation to one engine on one
+            // rig, and it predicts knock early on anything else. Like Woschni
+            // above, it gets the calibration multiplier such correlations are
+            // normally used with - set so a stock 10.5:1 engine on 95 RON is
+            // knock-limited around 30 degrees of advance, which is where a real
+            // one is.
+            tau *= m_p.knockScale;
             c.knockIntegral += dt / std::max(tau, 1.0e-5);
             if (c.knockIntegral >= 1.0) {
                 const double remaining = std::max(0.0, 1.0 - c.burnFraction);
@@ -792,6 +876,11 @@ void Engine::step(double dt) {
         exchange(collector(), amb, outlet);
     }
     m_collectorMass = std::max(m_collectorMass, 1e-9);
+    m_collectorTemp = Thermo::temperature(m_collectorEnergy / m_collectorMass, 1.0);
+    // Everything the engine breathes passes through the collector, so its own
+    // throughput is what sets the film coefficient there.
+    pipeLoss(m_collectorEnergy, m_collectorMass, m_collectorTemp, m_collectorWall,
+             m_collectorWallArea, m_throttleFlow);
     m_collectorTemp = Thermo::temperature(m_collectorEnergy / m_collectorMass, 1.0);
     m_collectorPressure = m_collectorMass * Thermo::R * m_collectorTemp / m_p.collectorVolume;
 

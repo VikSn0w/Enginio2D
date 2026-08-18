@@ -155,8 +155,11 @@ struct EngineParams {
     double wallTemp       = 450.0;  // K
     // Single-zone models always under-predict wall heat loss (they see none of
     // the crevices, the quench layer or the blowby), so Woschni gets the
-    // calibration multiplier such models are normally used with.
-    double heatTransferScale = 1.8;
+    // calibration multiplier such models are normally used with. It was set
+    // higher before the heat release was limited by the available oxygen,
+    // where it was quietly cancelling out energy the air could never have
+    // supplied.
+    double heatTransferScale = 1.5;
     double misfireLimit   = 0.60;   // burned fraction at which the flame dies
 
     // Knock. The unburned charge ahead of the flame is compressed and heated by
@@ -164,6 +167,7 @@ struct EngineParams {
     // there, it goes off on its own.
     bool   knockControl   = true;   // ECU pulls timing when it hears knock
     double knockRetardMax = 12.0;   // deg
+    double knockScale     = 1.0;    // calibration multiplier on the induction time
 
     // Mechanics
     double inertia         = 0.18;  // kg m^2, crank + flywheel + clutch
@@ -249,6 +253,9 @@ struct Cylinder {
     double exRunnerBurned   = 0.0;
     double exRunnerPressure = Thermo::pAmb;
     double exRunnerTemp     = Thermo::tAmb;
+    // The primary pipe is a radiator, and its own temperature is what decides
+    // how much it takes out of the gas going past.
+    double exWallTemp       = Thermo::tAmb;
 
     // Reference state captured at intake valve closing, for the Woschni
     // correlation's motored-pressure term and for the unburned-gas temperature
@@ -344,7 +351,11 @@ public:
     void setSpeedHold(bool on, double rpm);
     double heldTorque() const { return m_torqueFilt; }
     // Skip the warm-up. A dyno pull is done on a hot engine, never a cold one.
-    void warmUp() { m_oilTemp = m_p.oilTempTarget; }
+    void warmUp() {
+        m_oilTemp = m_p.oilTempTarget;
+        m_collectorWall = 900.0;
+        for (Cylinder& c : m_cyl) c.exWallTemp = 950.0;
+    }
 
     double rpm() const { return m_omega * 60.0 / (2.0 * 3.14159265358979323846); }
 
@@ -428,6 +439,9 @@ private:
     double m_collectorBurned   = 0.0;
     double m_collectorTemp     = Thermo::tAmb;
     double m_collectorPressure = Thermo::pAmb;
+    double m_collectorWall     = Thermo::tAmb;
+    double m_exRunnerWallArea  = 0.0;   // m^2, one primary
+    double m_collectorWallArea = 0.0;
 
     double m_pistonArea   = 0.0;
     double m_clearance    = 0.0;

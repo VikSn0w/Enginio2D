@@ -180,8 +180,10 @@ void Synth::step(const sim::Engine& engine, float gain, float& left, float& righ
         // Detonation is not a louder combustion event, it is a different one:
         // a hard, bright ring as the end gas goes off against the chamber.
         const float knock = static_cast<float>(c.knockShock);
+        // Scaled by how much charge actually went off, so trace detonation is a
+        // tick rather than a hammer.
         if (knock > 0.05f && m_lastKnock[i] <= 0.05f)
-            m_knockBurst.trigger(0.30f + 0.55f * knock, 0.9975f);
+            m_knockBurst.trigger(0.06f + 0.80f * knock * knock, 0.9975f);
         m_lastKnock[i] = knock;
     }
 
