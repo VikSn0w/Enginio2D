@@ -25,6 +25,14 @@ class Drivetrain {
 public:
     explicit Drivetrain(DrivetrainParams p = {}) : m_p(std::move(p)) {}
 
+    // Swap in new ratios and vehicle data while running. A gear that no longer
+    // exists drops to the highest one that does.
+    void setParams(const DrivetrainParams& p) {
+        m_p = p;
+        if (m_gear > gearCount()) m_gear = gearCount();
+    }
+    const DrivetrainParams& params() const { return m_p; }
+
     void setGear(int g);
     void shiftUp()   { setGear(m_gear + 1); }
     void shiftDown() { setGear(m_gear - 1); }

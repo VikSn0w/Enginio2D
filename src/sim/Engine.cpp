@@ -89,7 +89,46 @@ double Thermo::temperature(double e, double y) {
     return std::clamp(T0 + x, 150.0, 3300.0);
 }
 
+// ---------------------------------------------------------------------------
+// Cam profile. A raised cosine has too pointed a nose to pass for a real cam;
+// raising it to a power below one flattens the top and steepens the flanks,
+// which is roughly what a polydyne profile looks like. How far below one the
+// exponent can go is a property of the valvetrain, not of the cam grinder's
+// imagination: a flat tappet runs out of contact patch long before a roller
+// does, and only a desmodromic or pneumatic head can follow a near-square
+// profile.
+// ---------------------------------------------------------------------------
+double valveLiftAt(const ValveTiming& v, double phaseDeg) {
+    double span = v.closeDeg - v.openDeg;
+    if (span < 0.0) span += 720.0;
+    if (span <= 1.0) return 0.0;
+    const double phase = wrap720(phaseDeg);
+    if (!inWindow(phase, wrap720(v.openDeg), wrap720(v.closeDeg))) return 0.0;
+    double x = phase - v.openDeg;
+    if (x < 0.0) x += 720.0;
+    if (x > span) return 0.0;
+    const double hump = 0.5 * (1.0 - std::cos(2.0 * kPi * x / span));
+    return v.maxLift * std::pow(hump, v.profileExp);
+}
+
 Engine::Engine(EngineParams params) : m_p(std::move(params)) {
+    rebuild(false);
+}
+
+void Engine::reconfigure(const EngineParams& params) {
+    m_p = params;
+    // The gas states cannot be carried across a change of geometry - the
+    // volumes they were computed for no longer exist - so they are re-seeded at
+    // ambient and the engine breathes its way back to a running state within a
+    // cycle or two. Crank speed, oil temperature and the driver's inputs do
+    // survive, which is what stops an edit from feeling like a restart.
+    rebuild(true);
+}
+
+void Engine::rebuild(bool preserveMotion) {
+    m_p.cylinders = std::clamp(m_p.cylinders, 1, static_cast<int>(kMaxCylinders));
+    m_p.compressionRatio = std::max(4.0, m_p.compressionRatio);
+
     m_pistonArea   = kPi * 0.25 * m_p.bore * m_p.bore;
     m_displacement = m_pistonArea * m_p.stroke;
     m_clearance    = m_displacement / (m_p.compressionRatio - 1.0);
@@ -100,11 +139,22 @@ Engine::Engine(EngineParams params) : m_p(std::move(params)) {
     const double runnerVol   = m_p.intakeRunner.length * m_p.intakeRunner.area;
     const double exRunnerVol = m_p.exhaustRunner.length * m_p.exhaustRunner.area;
 
-    m_cyl.resize(static_cast<std::size_t>(m_p.cylinders));
+    if (!preserveMotion) {
+        m_crankAngle = 0.0;
+        m_omega      = 0.0;
+        m_throttle   = 0.0;
+        m_oilTemp    = m_p.oilStartTemp;
+    }
+    m_spool = 0.0;
+    m_boostPressure = Thermo::pAmb;
+    m_boostTemp     = Thermo::tAmb;
+    m_knockLevel = m_knockRetard = 0.0;
+
+    m_cyl.assign(static_cast<std::size_t>(m_p.cylinders), Cylinder{});
     for (std::size_t i = 0; i < m_cyl.size(); ++i) {
         const double offset = i < m_p.phaseOffsets.size() ? m_p.phaseOffsets[i] : 0.0;
         Cylinder& c   = m_cyl[i];
-        c.phase       = wrap720(offset);
+        c.phase       = wrap720(m_crankAngle + offset);
         c.volume      = cylinderVolume(c.phase);
         c.pressure    = Thermo::pAmb;
         c.temperature = Thermo::tAmb;
@@ -120,34 +170,28 @@ Engine::Engine(EngineParams params) : m_p(std::move(params)) {
 
     m_plenumMass   = Thermo::pAmb * m_p.plenumVolume / (Thermo::R * Thermo::tAmb);
     m_plenumEnergy = m_plenumMass * Thermo::energy(Thermo::tAmb, 0.0);
+    m_plenumBurned = 0.0;
 
     m_collectorMass   = Thermo::pAmb * m_p.collectorVolume / (Thermo::R * Thermo::tAmb);
     m_collectorEnergy = m_collectorMass * Thermo::energy(Thermo::tAmb, 1.0);
     m_collectorBurned = m_collectorMass;
 
-    for (auto& t : m_trace) t.store(0.0f, std::memory_order_relaxed);
+    if (!preserveMotion)
+        for (auto& t : m_trace) t.store(0.0f, std::memory_order_relaxed);
 }
 
 void Engine::setThrottle(double t) { m_throttle = std::clamp(t, 0.0, 1.0); }
 
-// ---------------------------------------------------------------------------
-// Cam profile. A raised cosine has too pointed a nose to pass for a real cam;
-// raising it to a power below one flattens the top and steepens the flanks,
-// which is roughly what a polydyne profile looks like.
-// ---------------------------------------------------------------------------
+void Engine::setSpeedHold(bool on, double rpmHold) {
+    m_speedHold = on;
+    m_holdOmega = rpmHold * 2.0 * kPi / 60.0;
+    if (on) m_omega = m_holdOmega;
+}
+
 void Engine::buildLiftTable(std::vector<double>& table, const ValveTiming& v) const {
     table.assign(kLiftBins, 0.0);
-    double span = v.closeDeg - v.openDeg;
-    if (span < 0.0) span += 720.0;
-    for (std::size_t i = 0; i < kLiftBins; ++i) {
-        const double phase = static_cast<double>(i) * 720.0 / kLiftBins;
-        if (!inWindow(phase, v.openDeg, v.closeDeg)) continue;
-        double x = phase - v.openDeg;
-        if (x < 0.0) x += 720.0;
-        const double u = x / span;
-        const double hump = 0.5 * (1.0 - std::cos(2.0 * kPi * u));
-        table[i] = v.maxLift * std::pow(hump, 0.82);
-    }
+    for (std::size_t i = 0; i < kLiftBins; ++i)
+        table[i] = valveLiftAt(v, static_cast<double>(i) * 720.0 / kLiftBins);
 }
 
 double Engine::lookupLift(const std::vector<double>& table, double phaseDeg) {
@@ -190,12 +234,95 @@ double Engine::orificeFlow(double pUp, double tUp, double pDown, double area) {
     return area * pUp * g_psi(pDown / pUp) / std::sqrt(Thermo::R * tUp);
 }
 
+// ---------------------------------------------------------------------------
+// Compressor. Everything upstream of the throttle plate lives here: on a
+// naturally aspirated engine that is just the atmosphere, on a blown one it is
+// the compressor discharge after the intercooler.
+// ---------------------------------------------------------------------------
+void Engine::updateCharger(double dt, double throttleFlow) {
+    m_throttleFlow += (throttleFlow - m_throttleFlow) * std::min(1.0, 30.0 * dt);
+
+    if (m_p.charger == 0 || m_p.boostTarget <= 0.0) {
+        m_boostPressure = Thermo::pAmb;
+        m_boostTemp     = Thermo::tAmb;
+        m_spool         = 0.0;
+        m_blowerTorque  = 0.0;
+        return;
+    }
+
+    const double speed = rpm();
+    double target = 0.0;
+    switch (m_p.charger) {
+        case 1: {
+            // Turbo: the turbine is driven by exhaust flow, so boost follows
+            // how much air the engine is already moving - which is exactly why
+            // it cannot make boost before it is making power. The first-order
+            // lag is the rotor's inertia.
+            const double refFlow = 1.18 * m_displacement * m_p.cylinders *
+                                   (std::max(m_p.spoolRpm, 800.0) / 120.0);
+            const double drive = std::clamp(m_throttleFlow / std::max(refFlow, 1e-6), 0.0, 1.0);
+            // A steady-state dyno point is settled by definition, so the rotor
+            // inertia is not part of the measurement.
+            const double tau = m_speedHold ? 0.02 : std::max(m_p.turboLag, 0.05);
+            m_spool += (drive - m_spool) * std::min(1.0, dt / tau);
+            target = m_spool;
+            break;
+        }
+        case 2:
+            // Roots blower: a positive-displacement pump geared to the crank.
+            // It makes its boost from just off idle, which is the whole point
+            // of one, and it takes its drive power the whole time.
+            m_spool = std::clamp((speed - 500.0) / std::max(600.0, m_p.spoolRpm * 0.4), 0.0, 1.0);
+            target = m_spool;
+            break;
+        default: {
+            // Centrifugal: pressure rises with the square of impeller speed, so
+            // it is worth nothing low down and everything at the top.
+            const double f = speed / std::max(m_p.spoolRpm, 800.0);
+            m_spool = std::clamp(f * f, 0.0, 1.0);
+            target = m_spool;
+            break;
+        }
+    }
+
+    const double ratio = 1.0 + (m_p.boostTarget * 1.0e5 / Thermo::pAmb) * target;
+    m_boostPressure = Thermo::pAmb * ratio;
+
+    // Isentropic compression plus the compressor's own inefficiency, then
+    // whatever the intercooler can give back. Charge temperature is what limits
+    // boost on a real engine long before the compressor runs out.
+    const double tIdeal = Thermo::tAmb * std::pow(ratio, 0.2857);
+    const double t2 = Thermo::tAmb + (tIdeal - Thermo::tAmb) /
+                                     std::clamp(m_p.compressorEff, 0.35, 0.95);
+    m_boostTemp = t2 - std::clamp(m_p.interCoolerEff, 0.0, 0.95) * (t2 - Thermo::tAmb);
+
+    // A belt blower is paid for out of crank torque; a turbo is paid for in
+    // backpressure, which the exhaust outlet area already carries.
+    if (m_p.charger != 1) {
+        const double power = m_throttleFlow * 1005.0 * std::max(0.0, t2 - Thermo::tAmb) /
+                             std::clamp(m_p.blowerDriveEff, 0.4, 0.98);
+        m_blowerTorque = power / std::max(m_omega, 20.0);
+    } else {
+        m_blowerTorque = 0.0;
+    }
+}
+
 void Engine::advance(double dt) {
-    // Cap the crank travel per sub-step so the valve and runner integration
-    // stays stable: at 8000 rpm one 44.1 kHz sample already spans ~1.1 deg.
+    // Two constraints on the sub-step, and the looser one wins.
+    //
+    // The explicit valve and runner integration needs a short enough step in
+    // *time* - around 8 us, which is comfortably inside what one unsubdivided
+    // 44.1 kHz sample already is at idle. It also needs enough resolution in
+    // crank angle to see a valve event at all, which is what the 0.25 degree
+    // cap is for. Insisting on the angle cap at every speed makes a twelve
+    // cylinder engine at 10000 rpm cost three times what it needs to, and the
+    // physics core has to keep up with the audio thread it runs on.
+    constexpr double kMinStep = 8.0e-6;   // s
+    constexpr double kMaxDeg  = 0.25;
     const double degPerStep = std::abs(m_omega) / kDegRad * dt;
-    int steps = static_cast<int>(std::ceil(degPerStep / 0.25));
-    steps = std::clamp(steps, 1, 32);
+    int steps = static_cast<int>(std::ceil(degPerStep / kMaxDeg));
+    steps = std::min(steps, static_cast<int>(std::ceil(dt / kMinStep)));
+    steps = std::clamp(steps, 1, 48);
     const double h = dt / steps;
     for (int i = 0; i < steps; ++i) step(h);
 }
@@ -206,6 +333,7 @@ void Engine::step(double dt) {
 
     const double runnerVol   = m_p.intakeRunner.length * m_p.intakeRunner.area;
     const double exRunnerVol = m_p.exhaustRunner.length * m_p.exhaustRunner.area;
+    const bool   diesel      = m_p.fuel.compressionIgnition;
 
     // Move mass, energy and composition from the higher-pressure node to the
     // lower one through a restriction. Returns the flow from a to b (kg/s).
@@ -234,15 +362,22 @@ void Engine::step(double dt) {
         const double db = dm * up.y;
         *up.mass -= dm; *up.energy -= dm * h; *up.burned -= db;
         *dn.mass += dm; *dn.energy += dm * h; *dn.burned += db;
+        return dm;
     };
 
-    // ---- Ambient reservoir -------------------------------------------------
+    // ---- Ambient / compressor reservoir ------------------------------------
     double ambMass = 1.0e9, ambEnergy = 0.0, ambBurned = 0.0;
     auto ambientNode = [&](double y) {
         ambMass = 1.0e9;
         ambEnergy = 0.0;
         ambBurned = 1.0e9 * y;
         return Node{&ambMass, &ambEnergy, &ambBurned, Thermo::pAmb, Thermo::tAmb, y};
+    };
+    auto upstreamNode = [&] {
+        ambMass = 1.0e9;
+        ambEnergy = 0.0;
+        ambBurned = 0.0;
+        return Node{&ambMass, &ambEnergy, &ambBurned, m_boostPressure, m_boostTemp, 0.0};
     };
 
     auto plenumNode = [&] {
@@ -255,12 +390,14 @@ void Engine::step(double dt) {
                     m_collectorPressure, m_collectorTemp, 1.0};
     };
 
-    // ---- Throttle: ambient <-> plenum --------------------------------------
+    // ---- Throttle: upstream <-> plenum --------------------------------------
     const double throttleMaxArea = kPi * 0.25 * m_p.throttleBore * m_p.throttleBore;
 
-    // Idle air control: PI on the bypass valve, active only near closed
-    // throttle. The integral term is what lets the engine hold a steady idle
-    // as the load changes.
+    // Idle control: PI on the bypass valve, active only near closed throttle.
+    // The integral term is what lets the engine hold a steady idle as the load
+    // changes. On a compression-ignition engine there is no throttle plate at
+    // all, so the same loop trims fuel instead of air - which is exactly what a
+    // diesel governor does.
     // The crank speed ripples within every cycle, so the loop reads a filtered
     // speed the way a real controller reads a filtered wheel count.
     const double rpmPrev = m_rpmFilt;
@@ -291,15 +428,18 @@ void Engine::step(double dt) {
     // A butterfly's effective area is very non-linear off its seat; squaring the
     // pedal command approximates that. The bypass is an area fraction, so it is
     // added after the curve rather than fed through it.
-    const double openFraction = bypass + (1.0 - bypass) * m_throttle * m_throttle;
+    const double openFraction = diesel ? 1.0
+                                       : bypass + (1.0 - bypass) * m_throttle * m_throttle;
     const double throttleArea = 0.9 * throttleMaxArea * openFraction;
+    double throttleFlow = 0.0;
     {
-        Node amb = ambientNode(0.0);
-        exchange(amb, plenumNode(), throttleArea);
+        Node up = upstreamNode();
+        throttleFlow = exchange(up, plenumNode(), throttleArea);
         const double y = std::clamp(m_plenumBurned / std::max(m_plenumMass, 1e-9), 0.0, 1.0);
         m_plenumTemp = Thermo::temperature(m_plenumEnergy / std::max(m_plenumMass, 1e-9), y);
         m_plenumPressure = m_plenumMass * Thermo::R * m_plenumTemp / m_p.plenumVolume;
     }
+    updateCharger(dt, std::max(0.0, throttleFlow));
 
     double gasTorque   = 0.0;
     double inertiaTorque = 0.0;
@@ -308,20 +448,72 @@ void Engine::step(double dt) {
     const double meanPistonSpeed = 2.0 * m_p.stroke * std::abs(m_omega) / (2.0 * kPi);
     const bool   fuelCut = !m_ignition || rpm() > m_p.redline;
 
+    // ---- Cam phaser ----------------------------------------------------------
+    // Advanced at low speed, where an early intake close traps the most charge;
+    // returned as speed rises, where the column's own momentum does that job and
+    // overlap is worth more.
+    {
+        const double f = std::clamp((rpm() - m_p.vvtLowRpm) /
+                                    std::max(200.0, m_p.vvtHighRpm - m_p.vvtLowRpm), 0.0, 1.0);
+        const double want = m_p.vvtRange * (1.0 - f);
+        m_camAdvance += (want - m_camAdvance) * std::min(1.0, 6.0 * dt);
+    }
+
+    // ---- Valve float ---------------------------------------------------------
+    // Past the float speed the spring can no longer keep the follower against
+    // the cam. Lift collapses, and with it the engine's ability to breathe -
+    // this is the wall a pushrod engine hits and a pneumatic-valve one does not.
+    m_floatLoss = std::clamp((rpm() - m_p.valveFloatRpm) / 900.0, 0.0, 1.0);
+    const double liftScale = 1.0 - 0.80 * m_floatLoss;
+
     // Spark and fuel maps. Advance climbs with speed and, because a light
     // charge burns slowly, with vacuum; mixture is stoichiometric on part
     // throttle and enriched at full load to hold peak pressure down.
-    const double loadFrac = std::clamp(m_plenumPressure / Thermo::pAmb, 0.0, 1.0);
+    const double loadFrac = std::clamp(m_plenumPressure / Thermo::pAmb, 0.0, 1.6);
     const double speedFrac = std::clamp((rpm() - 1000.0) / 4500.0, 0.0, 1.0);
+    const double loadForMix = std::clamp(loadFrac, 0.0, 1.0);
+    m_lambda = m_p.lambdaCruise + (m_p.lambdaPower - m_p.lambdaCruise) *
+                                  std::clamp((loadFrac - 0.55) / 0.45, 0.0, 1.0);
+    m_afr = m_lambda * m_p.fuel.stoichAfr;
+
+    // Knock feedback. A knock sensor cannot tell the ECU how to avoid knock,
+    // only that it is happening, so the correction is reactive: pull timing
+    // fast, give it back slowly.
+    m_knockLevel *= std::exp(-dt * 1.5);
+    if (m_p.knockControl) {
+        const double want = std::clamp(m_knockLevel * 3.0, 0.0, 1.0) * m_p.knockRetardMax;
+        if (want > m_knockRetard) m_knockRetard += (want - m_knockRetard) * std::min(1.0, 25.0 * dt);
+        else                      m_knockRetard = std::max(0.0, m_knockRetard - dt * 1.2);
+    } else {
+        m_knockRetard = 0.0;
+    }
+
+    // Every boosted spark map pulls timing as manifold pressure climbs past
+    // ambient: the charge is denser, the flame faster, and the end gas that
+    // much closer to lighting on its own. A diesel has the opposite problem -
+    // it wants its fuel in early - so this applies only where there is a spark.
+    const double boostRetard = diesel ? 0.0
+        : 12.0 * std::max(0.0, m_plenumPressure / Thermo::pAmb - 1.0);
     m_sparkAdvance = m_p.sparkIdle +
                      (m_p.sparkHighSpeed - m_p.sparkIdle) * speedFrac +
-                     m_p.sparkPartLoad * (1.0 - loadFrac);
-    m_afr = m_p.afrCruise + (m_p.afrPower - m_p.afrCruise) *
-                            std::clamp((loadFrac - 0.55) / 0.45, 0.0, 1.0);
+                     m_p.sparkPartLoad * (1.0 - loadForMix) - m_knockRetard - boostRetard;
+    m_sparkAdvance = std::clamp(m_sparkAdvance, -10.0, 60.0);
     const double sparkPhase = wrap720(720.0 - m_sparkAdvance);
     const double a  = 0.5 * m_p.stroke;
     const double l  = m_p.rodLength;
     const double boreFactor = std::pow(m_p.bore, -0.2);
+
+    // Fuel demand on a compression-ignition engine is the pedal itself: there
+    // is no throttle, the rack just meters more fuel into the same air.
+    const double fuelDemand = std::clamp(std::max(m_throttle, m_idleCmd * 0.16), 0.0, 1.0);
+
+    // Charge cooling. Port-injected fuel evaporates in the runner and takes its
+    // latent heat out of the air going past it. On petrol this is worth a few
+    // degrees; on methanol it is worth a hundred, and it is most of why alcohol
+    // fuels make power.
+    const double coolPerKgAir = diesel ? 0.0
+                                       : m_p.fuel.vaporHeat * m_p.fuel.portEvap /
+                                         std::max(m_afr, 3.0);
 
     for (std::size_t ci = 0; ci < m_cyl.size(); ++ci) {
         Cylinder& c = m_cyl[ci];
@@ -333,8 +525,8 @@ void Engine::step(double dt) {
         c.volume = cylinderVolume(c.phase);
         const double dV = c.volume - Vprev;
 
-        c.intakeLift  = lookupLift(m_intakeLift, c.phase);
-        c.exhaustLift = lookupLift(m_exhaustLift, c.phase);
+        c.intakeLift  = lookupLift(m_intakeLift, c.phase + m_camAdvance) * liftScale;
+        c.exhaustLift = lookupLift(m_exhaustLift, c.phase) * liftScale;
         const double aInt = portArea(m_p.intake,  c.intakeLift);
         const double aExh = portArea(m_p.exhaust, c.exhaustLift);
 
@@ -371,7 +563,10 @@ void Engine::step(double dt) {
         const double rhoRunner = c.runnerPressure / (Thermo::R * c.runnerTemp);
         accelerate(c.intakeFlowRate, m_plenumPressure, c.runnerPressure,
                    rhoRunner, m_p.intakeRunner);
-        convect(plenumNode(), runNode(), c.intakeFlowRate);
+        const double intoRunner = convect(plenumNode(), runNode(), c.intakeFlowRate);
+        // The injector sits in the port, so the evaporation happens here.
+        if (c.intakeFlowRate > 0.0 && coolPerKgAir > 0.0)
+            c.runnerEnergy -= intoRunner * coolPerKgAir;
 
         const double rhoEx = c.exRunnerPressure / (Thermo::R * c.exRunnerTemp);
         accelerate(c.exhaustFlowRate, c.exRunnerPressure, m_collectorPressure,
@@ -410,7 +605,7 @@ void Engine::step(double dt) {
         refreshCylinder();
         const double yCyl = c.burnedMass / c.mass;
 
-        // ---- Combustion ------------------------------------------------------
+        // ---- Ignition ---------------------------------------------------------
         const bool crossedSpark = prevPhase != c.phase && inWindow(sparkPhase, prevPhase, c.phase);
         if (crossedSpark) {
             // Residual dilution slows the flame and, past roughly a third of
@@ -419,18 +614,47 @@ void Engine::step(double dt) {
             // flame gets slower and less complete until it fails to propagate.
             const double dilutionEff = std::clamp(1.0 - 1.6 * std::max(0.0, yCyl - 0.25), 0.0, 1.0);
             const bool misfire = yCyl > m_p.misfireLimit;
-            if (!fuelCut && !misfire) {
+            // A diesel has no spark: it needs the charge to already be hot
+            // enough to light the injected fuel, which is why a cold one will
+            // crank all day without catching.
+            const bool willLight = !diesel || c.temperature > m_p.fuel.autoIgnitionK * 0.72;
+            if (!fuelCut && !misfire && willLight && fuelDemand > 1e-3) {
                 c.burning       = true;
                 c.burnFraction  = 0.0;
                 c.chargeAtSpark = c.mass;
-                c.burnStart     = wrap720(sparkPhase + m_p.ignitionDelay);
-                // Burn duration in crank angle grows slowly with speed and
-                // sharply with dilution.
-                const double speedTerm = 0.80 + 0.20 * std::min(2.5, rpm() / 3000.0);
-                c.burnSpan = m_p.burnDuration * speedTerm * (1.0 + 1.6 * yCyl);
-                // Only the unburned part of the charge carries fuel.
-                c.fuelEnergy = (c.mass * (1.0 - yCyl) / m_afr) * m_p.fuelLHV *
-                               m_p.combustionEff * dilutionEff;
+                c.knockIntegral = 0.0;
+
+                if (diesel) {
+                    // Ignition delay is a chemical clock: the hotter the
+                    // charge, the sooner it goes off. A cold engine's long
+                    // delay is what makes a diesel rattle on a winter morning.
+                    const double tRatio = std::clamp(m_p.fuel.autoIgnitionK / c.temperature, 0.4, 3.0);
+                    const double delay  = m_p.ignitionDelay * tRatio * tRatio;
+                    c.burnStart = wrap720(sparkPhase + delay);
+                    // Fuelling is limited by air, not by air by fuelling: past
+                    // the smoke limit more fuel is just soot.
+                    const double maxFuel = c.airTrapped / std::max(m_p.fuel.smokeAfr, 8.0);
+                    c.fuelMass  = maxFuel * fuelDemand;
+                    m_afr    = c.airTrapped / std::max(c.fuelMass, 1e-9);
+                    m_lambda = m_afr / m_p.fuel.stoichAfr;
+                    // Diffusion burning is slower than a premixed flame and
+                    // gets slower the more fuel there is to find air for.
+                    c.burnSpan = m_p.burnDuration * (0.75 + 0.45 * fuelDemand) /
+                                 std::max(m_p.fuel.flameSpeed, 0.2);
+                } else {
+                    c.burnStart = wrap720(sparkPhase + m_p.ignitionDelay);
+                    // Burn duration in crank angle grows slowly with speed and
+                    // sharply with dilution, and a mixture away from its
+                    // fastest-burning point (slightly rich) burns slower still.
+                    const double speedTerm = 0.80 + 0.20 * std::min(2.5, rpm() / 3000.0);
+                    const double mixTerm = 1.0 + 1.8 * (m_lambda - 0.9) * (m_lambda - 0.9);
+                    c.burnSpan = m_p.burnDuration * speedTerm * (1.0 + 1.6 * yCyl) * mixTerm /
+                                 std::max(m_p.fuel.flameSpeed, 0.2);
+                    // Only the unburned part of the charge carries fuel.
+                    c.fuelMass = c.mass * (1.0 - yCyl) / std::max(m_afr, 3.0);
+                }
+                c.fuelEnergy = c.fuelMass * m_p.fuel.lhv * m_p.combustionEff * dilutionEff;
+                m_fuelAccum += c.fuelMass;
             }
         }
 
@@ -454,6 +678,42 @@ void Engine::step(double dt) {
             }
         }
 
+        // ---- Knock ------------------------------------------------------------
+        // The end gas is compressed by the flame front as much as by the piston.
+        // Douaud-Eyzat gives its induction time; Livengood-Wu integrates the
+        // reciprocal of that time, and when the integral reaches one the end gas
+        // lights on its own - all of it at once, which is the noise.
+        if (!diesel && c.burning && c.knockIntegral >= 0.0 && c.pressure > 5.0e5) {
+            const double tu = std::clamp(
+                c.refTemp * std::pow(c.pressure / std::max(c.refPressure, 1.0e4), 0.2857),
+                300.0, 1400.0);
+            const double pAtm = c.pressure / 101325.0;
+            double tau = 17.68e-3 * std::pow(std::max(m_p.fuel.octane, 40.0) * 0.01, 3.402) *
+                         std::pow(pAtm, -1.7) * std::exp(3800.0 / tu);
+            // Knock resistance is a bowl, not a slope. It is worst just lean of
+            // stoichiometric, where the flame is hottest; enrichment cools the
+            // charge, and running properly lean drops peak temperature far
+            // enough that a hydrogen or lean-burn engine barely knocks at all.
+            const double dl = m_lambda - 1.05;
+            tau *= std::clamp(0.90 + 6.0 * dl * dl + (dl < 0.0 ? -1.6 * dl : 0.0), 0.85, 5.0);
+            c.knockIntegral += dt / std::max(tau, 1.0e-5);
+            if (c.knockIntegral >= 1.0) {
+                const double remaining = std::max(0.0, 1.0 - c.burnFraction);
+                // What is left of the charge goes off in one step.
+                const double burst = 0.7 * remaining;
+                dQcomb += burst * c.fuelEnergy;
+                c.burnedMass += burst * c.chargeAtSpark * (1.0 - yCyl);
+                c.burnFraction = std::min(1.0, c.burnFraction + burst);
+                c.knockShock = std::max(c.knockShock, remaining);
+                // The gauge tracks how hard each event is, not how many there
+                // have been - accumulating would peg it at full scale after a
+                // second of the mildest detonation.
+                m_knockLevel += (remaining - m_knockLevel) * 0.35;
+                c.knockIntegral = -1.0;   // one event per cycle
+            }
+        }
+        c.knockShock *= std::exp(-dt * 30.0);
+
         // ---- Wall heat transfer (Woschni) -------------------------------------
         // The second velocity term is what makes heat loss during combustion
         // realistic: without it, peak pressure comes out far too high.
@@ -466,7 +726,10 @@ void Engine::step(double dt) {
                           std::pow(c.pressure * 0.001, 0.8) *
                           std::pow(c.temperature, -0.55) * std::pow(w, 0.8);
         const double area = 2.0 * m_pistonArea + kPi * m_p.bore * (c.volume / m_pistonArea);
-        const double dQwall = hc * area * (c.temperature - m_p.wallTemp) * dt;
+        // Detonation scrubs the boundary layer off the chamber walls, which is
+        // what actually melts pistons.
+        const double dQwall = hc * area * (c.temperature - m_p.wallTemp) * dt *
+                              (1.0 + 2.0 * c.knockShock);
 
         // Motored pressure reference, integrated polytropically. dV per sub-step
         // is tiny, so the first-order expansion of (V_prev/V)^gamma is exact
@@ -495,11 +758,13 @@ void Engine::step(double dt) {
         peakForFriction = std::max(peakForFriction, c.pressure);
 
         // ---- Per-cycle bookkeeping at intake valve closing --------------------
-        if (prevPhase != c.phase && inWindow(m_p.intake.closeDeg, prevPhase, c.phase)) {
+        const double ivc = wrap720(m_p.intake.closeDeg - m_camAdvance);
+        if (prevPhase != c.phase && inWindow(ivc, prevPhase, c.phase)) {
             c.refPressure     = c.pressure;
             c.refVolume       = c.volume;
             c.refTemp         = c.temperature;
             c.motoredPressure = c.pressure;
+            c.airTrapped      = c.mass * (1.0 - c.burnedMass / c.mass);
             if (ci == 0) {
                 const double rhoRef = Thermo::pAmb / (Thermo::R * Thermo::tAmb);
                 m_volEff   = c.freshTrapped / (rhoRef * m_displacement);
@@ -518,13 +783,34 @@ void Engine::step(double dt) {
     }
 
     // ---- Collector vents to atmosphere ---------------------------------------
+    // A turbine sits in this path on a turbocharged engine, and the exhaust has
+    // to be pushed through it: that restriction is the price of the boost.
     {
         Node amb = ambientNode(1.0);
-        exchange(collector(), amb, m_p.outletArea);
+        const double outlet = m_p.outletArea *
+                              (m_p.charger == 1 ? std::clamp(m_p.turbineRestrict, 0.2, 1.0) : 1.0);
+        exchange(collector(), amb, outlet);
     }
     m_collectorMass = std::max(m_collectorMass, 1e-9);
     m_collectorTemp = Thermo::temperature(m_collectorEnergy / m_collectorMass, 1.0);
     m_collectorPressure = m_collectorMass * Thermo::R * m_collectorTemp / m_p.collectorVolume;
+
+    // ---- Oil -----------------------------------------------------------------
+    // Oil warms towards a load-dependent temperature, and its viscosity there
+    // is what sets both the hydrodynamic friction and the pressure the pump can
+    // build. Cold oil costs power; hot thin oil costs oil pressure.
+    {
+        const double duty = std::clamp(rpm() / 2600.0, 0.0, 1.0) * (0.45 + 0.55 * loadForMix);
+        const double target = m_p.oilStartTemp + (m_p.oilTempTarget - m_p.oilStartTemp) *
+                                                 std::clamp(0.25 + duty, 0.0, 1.15);
+        m_oilTemp += (target - m_oilTemp) * std::min(1.0, dt / 55.0);
+    }
+    // Viscosity between the two grade points, log-interpolated and extrapolated
+    // past them - which is exactly how a multigrade is specified.
+    const double viscMix = std::clamp((m_oilTemp - 313.0) / 60.0, -0.9, 1.8);
+    const double visc = std::max(0.15, m_p.oil.viscosity40 *
+        std::pow(std::max(m_p.oil.viscosity100, 0.05) / std::max(m_p.oil.viscosity40, 0.05), viscMix));
+    m_oilPressure = std::min(5.2e5, 0.30e5 + rpm() * 100.0 * std::pow(visc, 0.8));
 
     // ---- Crank dynamics --------------------------------------------------------
     // Chen-Flynn: friction rises with peak cylinder pressure and with the
@@ -534,14 +820,17 @@ void Engine::step(double dt) {
     // this instant, so the peak is held and bled off slowly.
     m_pmaxHold = std::max(peakForFriction, m_pmaxHold * (1.0 - 3.0 * dt));
     const double pmaxBar = m_pmaxHold * 1e-5;
-    const double fmepBar = m_p.cfA + m_p.cfB * pmaxBar +
-                           m_p.cfC * meanPistonSpeed +
-                           m_p.cfD * meanPistonSpeed * meanPistonSpeed;
+    const double viscTerm = std::pow(visc, 0.6) * m_p.valvetrainDrag;
+    const double boundary = m_p.cfA * (0.55 + 0.45 / std::clamp(m_p.oil.filmStrength, 0.4, 2.0));
+    const double fmepBar = boundary + m_p.cfB * pmaxBar +
+                           (m_p.cfC * meanPistonSpeed +
+                            m_p.cfD * meanPistonSpeed * meanPistonSpeed) * viscTerm;
     m_fmep = fmepBar * 1e5;
     const double totalDisp = m_displacement * m_p.cylinders;
     // FMEP is a mean pressure per swept volume per cycle; a four-stroke turns
     // 4*pi radians per cycle.
-    const double frictionTorque = m_fmep * totalDisp / (4.0 * kPi) + m_p.accessoryTorque;
+    const double frictionTorque = m_fmep * totalDisp / (4.0 * kPi) + m_p.accessoryTorque +
+                                  m_blowerTorque;
 
     const double dir = m_omega > 0.0 ? 1.0 : 0.0;   // no braking torque at rest
     double torque = gasTorque + inertiaTorque - frictionTorque * dir;
@@ -552,12 +841,27 @@ void Engine::step(double dt) {
     // nothing, in gear it is the car.
     torque += m_drive.step(dt, m_omega);
 
-    m_omega += torque / m_p.inertia * dt;
-    if (m_omega < 0.0) m_omega = 0.0;   // the crank never spins backwards here
+    if (m_speedHold) {
+        // On the dyno the brake holds the speed and the torque it has to absorb
+        // is the number being measured, so the crank does not accelerate at all.
+        m_omega = m_holdOmega;
+    } else {
+        m_omega += torque / m_p.inertia * dt;
+        if (m_omega < 0.0) m_omega = 0.0;   // the crank never spins backwards here
+    }
 
     m_netTorque = torque;
     const double brakeTorque = gasTorque - frictionTorque * dir;
     m_torqueFilt += (brakeTorque - m_torqueFilt) * std::min(1.0, 6.0 * dt);
+
+    // Fuel flow, averaged over a window long enough to cover a whole cycle at
+    // any speed so the readout does not flicker with each firing.
+    m_fuelWindow += dt;
+    if (m_fuelWindow > 0.25) {
+        m_fuelRate += (m_fuelAccum / m_fuelWindow - m_fuelRate) * 0.5;
+        m_fuelAccum = 0.0;
+        m_fuelWindow = 0.0;
+    }
 }
 
 Snapshot Engine::snapshot() const {
@@ -583,7 +887,21 @@ Snapshot Engine::snapshot() const {
     s.residualFraction = static_cast<float>(m_residual);
     s.sparkAdvance     = static_cast<float>(m_sparkAdvance);
     s.afr              = static_cast<float>(m_afr);
+    s.lambda           = static_cast<float>(m_lambda);
     s.idleValve        = static_cast<float>(m_idleCmd);
+    s.boost            = static_cast<float>((m_boostPressure - Thermo::pAmb) * 0.001);
+    s.chargeTemp       = static_cast<float>(m_boostTemp);
+    s.knock            = static_cast<float>(std::clamp(m_knockLevel, 0.0, 1.0));
+    s.knockRetard      = static_cast<float>(m_knockRetard);
+    s.oilTemp          = static_cast<float>(m_oilTemp);
+    s.oilPressure      = static_cast<float>(m_oilPressure * 1e-5);
+    s.camAdvance       = static_cast<float>(m_camAdvance);
+    s.valveFloat       = static_cast<float>(m_floatLoss);
+    s.fuelFlow         = static_cast<float>(m_fuelRate * 3600.0);
+    // Fuel per unit of work only means anything when there is work: on the
+    // limiter, or overrunning, the engine is still burning fuel for no output.
+    const double kw = m_torqueFilt * m_omega * 0.001;
+    s.bsfc             = kw > 3.0 ? static_cast<float>(m_fuelRate * 3.6e6 / kw) : 0.0f;
     s.cylinderCount    = static_cast<int>(m_cyl.size());
     for (std::size_t i = 0; i < m_cyl.size() && i < s.cyl.size(); ++i) {
         const Cylinder& c = m_cyl[i];
@@ -591,12 +909,14 @@ Snapshot Engine::snapshot() const {
         v.phase          = static_cast<float>(c.phase);
         v.pressure       = static_cast<float>(c.pressure * 1e-5);
         v.temperature    = static_cast<float>(c.temperature);
-        v.intakeLift     = static_cast<float>(c.intakeLift / m_p.intake.maxLift);
-        v.exhaustLift    = static_cast<float>(c.exhaustLift / m_p.exhaust.maxLift);
+        v.intakeLift     = static_cast<float>(c.intakeLift / std::max(m_p.intake.maxLift, 1e-6));
+        v.exhaustLift    = static_cast<float>(c.exhaustLift / std::max(m_p.exhaust.maxLift, 1e-6));
         v.burnFraction   = static_cast<float>(c.burning ? c.burnFraction : 0.0);
         v.burnedGas      = static_cast<float>(c.burnedMass / std::max(c.mass, 1e-12));
         v.runnerPressure = static_cast<float>(c.runnerPressure * 0.001);
         v.exRunnerPressure = static_cast<float>(c.exRunnerPressure * 0.001);
+        v.knock          = static_cast<float>(std::clamp(c.knockShock, 0.0, 1.0));
+        v.bank           = i < m_p.cylinderBank.size() ? m_p.cylinderBank[i] : 0;
     }
     return s;
 }

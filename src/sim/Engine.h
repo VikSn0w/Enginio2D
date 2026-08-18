@@ -8,6 +8,9 @@
 
 namespace sim {
 
+// Everything downstream sizes its arrays off this, so a W16 fits.
+inline constexpr std::size_t kMaxCylinders = 16;
+
 // ---------------------------------------------------------------------------
 // Working fluid.
 //
@@ -56,7 +59,18 @@ struct ValveTiming {
     double diameter;  // m, valve head diameter (sets the curtain area)
     int    count;     // valves of this type per cylinder
     double cdScale;   // multiplies the lift-dependent discharge coefficient
+    // Shape of the flank. A raised cosine has too pointed a nose to pass for a
+    // real cam; an exponent below one flattens the nose and steepens the
+    // flanks, which is what a fast road or race profile looks like. How far it
+    // can be pushed is set by the valvetrain: a flat tappet cannot follow what
+    // a roller or a desmo mechanism can.
+    double profileExp = 0.82;
 };
+
+// Lift in metres at a cycle angle, straight from the profile. Both the engine's
+// baked table and the timing diagram in the UI go through this, so the drawing
+// can never disagree with the simulation.
+double valveLiftAt(const ValveTiming& v, double phaseDeg);
 
 // One gas column between a plenum and a port: an inertance (the mass of gas
 // that has to be accelerated) plus a small volume. With the cylinder these
@@ -68,6 +82,33 @@ struct RunnerSpec {
     double viscous;   // Pa per (kg/s), wall friction and thermal damping
 };
 
+// ---------------------------------------------------------------------------
+// Fuel. What actually distinguishes one fuel from another in a cycle
+// simulation is: how much energy a kilogram carries, how much air that
+// kilogram needs, how much heat it steals from the charge as it evaporates,
+// how fast the flame crosses the chamber, and how hard it is to detonate.
+// ---------------------------------------------------------------------------
+struct FuelSpec {
+    double lhv        = 44.0e6;   // J/kg
+    double stoichAfr  = 14.7;     // kg air per kg fuel
+    double vaporHeat  = 350.0e3;  // J/kg, latent heat - this is the charge cooling
+    double portEvap   = 0.55;     // fraction that evaporates in the port, not the bore
+    double octane     = 95.0;     // RON, feeds the knock induction time
+    double flameSpeed = 1.0;      // multiplies burn rate (methanol burns fast, LPG slow)
+    bool   compressionIgnition = false;
+    double autoIgnitionK = 850.0; // K, charge temperature a diesel needs to light
+    double smokeAfr   = 18.0;     // CI only: richest mixture before it just makes soot
+};
+
+// Oil. Viscosity sets the hydrodynamic part of engine friction and the oil
+// pressure the pump can build; film strength is what stops the boundary term
+// climbing when the oil is hot and thin.
+struct OilSpec {
+    double viscosity40  = 1.00;  // relative to a 5W-30 at 40 C
+    double viscosity100 = 1.00;  // ... and at 100 C
+    double filmStrength = 1.00;
+};
+
 struct EngineParams {
     // Geometry (defaults: ~2.0 L inline-four)
     double bore             = 0.086;   // m
@@ -75,12 +116,30 @@ struct EngineParams {
     double rodLength        = 0.145;   // m
     double compressionRatio = 10.5;
     int    cylinders        = 4;
+    int    banks            = 1;       // 1 for an inline, 2 for a V or flat, 4 for a W
+    double bankAngle        = 0.0;     // deg, included angle
     // Crank angle at which each cylinder sits, relative to cylinder 1.
     // Inline-four, firing order 1-3-4-2.
     std::vector<double> phaseOffsets{0.0, 540.0, 180.0, 360.0};
+    // Which bank each cylinder belongs to. The physics runs one collector, but
+    // the exhaust synthesis needs this: a crossplane V8 only burbles because
+    // each bank's pulse train is uneven on its own.
+    std::vector<int> cylinderBank{0, 0, 0, 0};
 
-    ValveTiming intake { 350.0, 580.0, 0.0100, 0.032, 2, 1.00 };
-    ValveTiming exhaust{ 130.0, 375.0, 0.0092, 0.028, 2, 0.92 };
+    ValveTiming intake { 350.0, 580.0, 0.0100, 0.032, 2, 1.00, 0.82 };
+    ValveTiming exhaust{ 130.0, 375.0, 0.0092, 0.028, 2, 0.92, 0.82 };
+
+    // Valvetrain. Above the float speed the springs can no longer keep the
+    // follower on the cam, and lift collapses - which is the real reason a
+    // pushrod engine stops making power where a pneumatic-valve one is still
+    // pulling.
+    double valveFloatRpm  = 8600.0;
+    double valvetrainDrag = 1.0;    // multiplies the speed-dependent friction terms
+    // Cam phaser: intake centreline is advanced at low speed for cylinder
+    // filling and returned at high speed for overlap, as a real phaser does.
+    double vvtRange   = 0.0;        // deg of authority, 0 disables
+    double vvtLowRpm  = 2200.0;
+    double vvtHighRpm = 6200.0;
 
     // Combustion. Spark advance and fuelling follow small maps rather than
     // being fixed, the way an ECU would run them.
@@ -89,9 +148,9 @@ struct EngineParams {
     double sparkPartLoad  = 12.0;   // extra advance at light load
     double burnDuration   = 46.0;   // deg at 3000 rpm, scaled with speed
     double ignitionDelay  = 8.0;    // deg between spark and first heat release
-    double afrCruise      = 14.7;   // stoichiometric at light load
-    double afrPower       = 12.8;   // enriched at full load
-    double fuelLHV        = 44.0e6; // J/kg
+    double lambdaCruise   = 1.00;   // commanded lambda at light load
+    double lambdaPower    = 0.87;   // ... and at full load
+    FuelSpec fuel;
     double combustionEff  = 0.94;
     double wallTemp       = 450.0;  // K
     // Single-zone models always under-predict wall heat loss (they see none of
@@ -100,6 +159,12 @@ struct EngineParams {
     double heatTransferScale = 1.8;
     double misfireLimit   = 0.60;   // burned fraction at which the flame dies
 
+    // Knock. The unburned charge ahead of the flame is compressed and heated by
+    // the flame itself; if it reaches its induction time before the flame gets
+    // there, it goes off on its own.
+    bool   knockControl   = true;   // ECU pulls timing when it hears knock
+    double knockRetardMax = 12.0;   // deg
+
     // Mechanics
     double inertia         = 0.18;  // kg m^2, crank + flywheel + clutch
     double recipMass       = 0.55;  // kg per cylinder, piston + small end
@@ -107,6 +172,9 @@ struct EngineParams {
     // Chen-Flynn friction: fmep[bar] = A + B*Pmax[bar] + C*Sp + D*Sp^2
     double cfA = 0.55, cfB = 0.008, cfC = 0.020, cfD = 0.0016;
     double accessoryTorque = 8.0;   // N m, alternator/water pump/oil pump drag
+    OilSpec oil;
+    double oilTempTarget   = 368.0; // K, oil temperature once warm
+    double oilStartTemp    = 293.0; // K, temperature at key-on
 
     // Induction
     double plenumVolume   = 0.0022; // m^3, manifold behind the throttle
@@ -119,10 +187,29 @@ struct EngineParams {
     double idleTargetRpm  = 850.0;
     RunnerSpec intakeRunner { 0.30, 0.00110, 1.1, 9.0e4 };
 
+    // Forced induction. 0 none, 1 turbo, 2 roots blower, 3 centrifugal blower.
+    int    charger        = 0;
+    double boostTarget    = 0.0;    // bar gauge at the wastegate/bypass setting
+    double spoolRpm       = 3000.0; // where a belt blower or turbo is on song
+    double turboLag       = 0.9;    // s, first-order spool time
+    double interCoolerEff = 0.70;   // 0 = no intercooler, 1 = charge back to ambient
+    double compressorEff  = 0.70;   // isentropic
+    double blowerDriveEff = 0.85;   // belt + rotor losses on a supercharger
+    double turbineRestrict= 1.00;   // multiplies exhaust outlet area (turbine backpressure)
+
     // Exhaust
     RunnerSpec exhaustRunner{ 0.42, 0.00090, 1.5, 7.0e4 };
     double collectorVolume = 0.0016; // m^3
     double outletArea      = 0.0022; // m^2, collector to the rest of the system
+
+    // Acoustic properties of the exhaust system. These feed the pipe model in
+    // the synthesiser rather than the gas dynamics, which is why they sit here
+    // and not in RunnerSpec: two systems can flow the same and sound nothing
+    // alike.
+    double primaryMismatch = 0.04;  // spread of primary lengths, 0 = equal length
+    double tailLength      = 0.72;  // m
+    double mufflerDamping  = 0.34;  // one-pole coefficient, higher is brighter
+    double exhaustLoudness = 1.00;
 
     double redline = 7600.0;        // rpm, fuel cut above this
 };
@@ -138,11 +225,14 @@ struct Cylinder {
 
     double burnFraction  = 0.0;  // Wiebe mass fraction burned
     double fuelEnergy    = 0.0;  // J for this combustion event
+    double fuelMass      = 0.0;  // kg burnt this event, for the fuel-flow readout
     double burnStart     = 0.0;  // cycle angle of first heat release
     double burnSpan      = 50.0; // deg, this event's duration
     double chargeAtSpark = 0.0;  // kg, for tracking product formation
     bool   burning       = false;
     bool   armed         = true; // spark not yet fired this cycle
+    double knockIntegral = 0.0;  // Livengood-Wu; 1.0 means the end gas lights
+    double knockShock    = 0.0;  // decaying marker of a knock event, for audio
 
     // Intake runner: momentum state plus a small volume at the port.
     double intakeFlowRate  = 0.0; // kg/s in the runner column
@@ -161,7 +251,8 @@ struct Cylinder {
     double exRunnerTemp     = Thermo::tAmb;
 
     // Reference state captured at intake valve closing, for the Woschni
-    // correlation's motored-pressure term.
+    // correlation's motored-pressure term and for the unburned-gas temperature
+    // the knock model needs.
     double refPressure     = Thermo::pAmb;
     double refVolume       = 1.0;
     double refTemp         = Thermo::tAmb;
@@ -172,6 +263,7 @@ struct Cylinder {
     double intakeLift       = 0.0; // m
     double exhaustLift      = 0.0; // m
     double freshTrapped     = 0.0; // kg of fresh charge taken in this cycle
+    double airTrapped       = 0.0; // kg of air at IVC, for the diesel's fuelling
 };
 
 // Per-cylinder data for the views.
@@ -185,6 +277,8 @@ struct CylinderView {
     float burnedGas      = 0.0f;  // mass fraction of the charge that is products
     float runnerPressure = 0.0f;  // kPa, intake runner
     float exRunnerPressure = 0.0f;// kPa, exhaust runner
+    float knock          = 0.0f;  // 0..1, this cylinder's last knock event
+    int   bank           = 0;
 };
 
 // A consistent copy of the state for the render thread.
@@ -203,7 +297,18 @@ struct Snapshot {
     float residualFraction = 0.0f; // burned mass left at IVC, cylinder 1
     float sparkAdvance     = 0.0f; // deg BTDC
     float afr              = 0.0f;
+    float lambda           = 0.0f;
     float idleValve        = 0.0f; // 0..1
+    float boost            = 0.0f; // kPa gauge upstream of the throttle
+    float chargeTemp       = 0.0f; // K, after the intercooler
+    float knock            = 0.0f; // 0..1, smoothed
+    float knockRetard      = 0.0f; // deg the ECU has pulled
+    float oilTemp          = 0.0f; // K
+    float oilPressure      = 0.0f; // bar
+    float camAdvance       = 0.0f; // deg of intake phaser authority in use
+    float valveFloat       = 0.0f; // 0 = following the cam, 1 = fully floating
+    float fuelFlow         = 0.0f; // kg/h
+    float bsfc             = 0.0f; // g/kWh
     int   gear             = 0;    // 0 = neutral
     int   gearCount        = 6;
     float speedKph         = 0.0f;
@@ -212,7 +317,7 @@ struct Snapshot {
     float wheelTorque      = 0.0f; // N m
     float brake            = 0.0f;
     int   cylinderCount    = 0;
-    std::array<CylinderView, 12> cyl{};
+    std::array<CylinderView, kMaxCylinders> cyl{};
 };
 
 class Engine {
@@ -224,10 +329,22 @@ public:
     // the valve and runner flows stable at high rpm.
     void advance(double dt);
 
+    // Swap in a new specification without stopping. Geometry, cams and gas
+    // volumes are rebuilt; crank speed and angle survive, so the engine keeps
+    // running through the change instead of restarting.
+    void reconfigure(const EngineParams& params);
+
     void setThrottle(double t);
     void setStarter(bool on)    { m_starter = on; }
     void setIgnition(bool on)   { m_ignition = on; }
     bool ignition() const       { return m_ignition; }
+
+    // Dyno mode: the crank is held at a fixed speed by an ideal brake, and the
+    // torque it takes to do that is the measurement.
+    void setSpeedHold(bool on, double rpm);
+    double heldTorque() const { return m_torqueFilt; }
+    // Skip the warm-up. A dyno pull is done on a hot engine, never a cold one.
+    void warmUp() { m_oilTemp = m_p.oilTempTarget; }
 
     double rpm() const { return m_omega * 60.0 / (2.0 * 3.14159265358979323846); }
 
@@ -250,6 +367,9 @@ public:
     double exhaustRunnerGauge(std::size_t i) const {
         return i < m_cyl.size() ? m_cyl[i].exRunnerPressure - Thermo::pAmb : 0.0;
     }
+    int cylinderBank(std::size_t i) const {
+        return i < m_p.cylinderBank.size() ? m_p.cylinderBank[i] : 0;
+    }
 
     // Cylinder-1 pressure in bar, binned by crank angle, for the P-theta plot.
     // Written by the audio thread, read by the render thread.
@@ -262,10 +382,12 @@ public:
 
 private:
     void   step(double dt);
+    void   rebuild(bool preserveMotion);
     double cylinderVolume(double phaseDeg) const;
     double dVolumeDTheta(double phaseDeg) const;  // m^3 per radian
     double portArea(const ValveTiming& v, double lift) const;
     static double orificeFlow(double pUp, double tUp, double pDown, double area);
+    void   updateCharger(double dt, double throttleFlow);
 
     // Cam profiles are baked into a 0.1 deg table at construction: faster than
     // evaluating the profile, and the shape can then be arbitrary.
@@ -282,6 +404,8 @@ private:
     double m_throttle   = 0.0;
     bool   m_starter    = false;
     bool   m_ignition   = true;
+    bool   m_speedHold  = false;
+    double m_holdOmega  = 0.0;
 
     // Intake plenum behind the throttle plate.
     double m_plenumMass     = 0.0;
@@ -289,6 +413,14 @@ private:
     double m_plenumBurned   = 0.0;   // reversion pushes products back up here
     double m_plenumTemp     = Thermo::tAmb;
     double m_plenumPressure = Thermo::pAmb;
+
+    // Upstream of the throttle: ambient on a naturally aspirated engine, the
+    // compressor discharge on a blown one.
+    double m_boostPressure = Thermo::pAmb;
+    double m_boostTemp     = Thermo::tAmb;
+    double m_spool         = 0.0;    // 0..1
+    double m_blowerTorque  = 0.0;    // N m taken off the crank by a belt blower
+    double m_throttleFlow  = 0.0;    // kg/s, filtered
 
     // Exhaust collector: every runner dumps into it, it vents to atmosphere.
     double m_collectorMass     = 0.0;
@@ -315,6 +447,16 @@ private:
     double m_idleIntegral = 0.5;
     double m_sparkAdvance = 20.0;  // deg BTDC, current map output
     double m_afr          = 14.0;
+    double m_lambda       = 1.0;
+    double m_knockLevel   = 0.0;   // smoothed knock intensity, 0..1
+    double m_knockRetard  = 0.0;   // deg the ECU is holding back
+    double m_camAdvance   = 0.0;   // deg, current phaser position
+    double m_floatLoss    = 0.0;   // 0 = on the cam, 1 = fully floating
+    double m_oilTemp      = Thermo::tAmb;
+    double m_oilPressure  = 0.0;   // Pa gauge
+    double m_fuelRate     = 0.0;   // kg/s, filtered
+    double m_fuelAccum    = 0.0;   // kg burnt since the last averaging window
+    double m_fuelWindow   = 0.0;   // s
 
     Drivetrain m_drive;
 

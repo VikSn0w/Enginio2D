@@ -19,14 +19,17 @@ endif()
 set(CMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO Release "")
 set(CMAKE_MAP_IMPORTED_CONFIG_MINSIZEREL Release "")
 
-set(SFML_DIR "C:/SFML-3.1.0/lib/cmake/SFML" CACHE PATH "SFML 3.1.0 install")
-find_package(SFML 3.1 REQUIRED COMPONENTS Graphics Audio Window System)
+find_package(SFML 3.1 REQUIRED COMPONENTS Graphics Audio Window System HINTS "deps/SFML/lib/cmake/SFML")
 
 add_executable(Enginio2D
         src/app/main.cpp
         src/sim/Engine.cpp
+        src/sim/EngineDesign.cpp
         src/sim/Drivetrain.cpp
+        src/sim/Dyno.cpp
         src/audio/EngineSound.cpp
+        src/ui/Widgets.cpp
+        src/ui/Editor.cpp
 )
 target_include_directories(Enginio2D PRIVATE src)
 target_link_libraries(Enginio2D PRIVATE SFML::Graphics SFML::Audio SFML::Window SFML::System)

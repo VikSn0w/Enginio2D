@@ -85,25 +85,53 @@ float SVF::low(float in) {
 }
 
 // ---------------------------------------------------------------------------
-void Synth::init(std::size_t cylinders, float sampleRate) {
-    m_cylCount = std::min(kMaxCyl, cylinders);
+void Synth::init(const sim::EngineParams& p, float sampleRate) {
+    m_cylCount  = std::min(kMaxCyl, static_cast<std::size_t>(std::max(1, p.cylinders)));
+    m_bankCount = std::min(kMaxBanks, static_cast<std::size_t>(std::max(1, p.banks)));
+
+    // The primary is the pipe between the port and the collector. Its length
+    // comes from the header, and the spread between cylinders comes from the
+    // header style: equal-length tubes stack their pulses into one note, a log
+    // manifold smears them, and that smear is the sound of the layout.
+    const float base = std::max(0.22f, static_cast<float>(p.exhaustRunner.length) * 1.9f);
     for (std::size_t i = 0; i < m_cylCount; ++i) {
-        // Primaries of slightly unequal length, as on any real manifold. The
-        // mismatch is what keeps the pulses from stacking into one
-        // synthetic-sounding tone.
-        const float len = 0.82f + 0.035f * static_cast<float>(i);
-        m_primary[i].init(len, sampleRate, -0.40f, 0.52f, 0.42f);
+        const float spread = static_cast<float>(p.primaryMismatch) *
+                             (static_cast<float>(i % 4) - 1.5f) * 0.5f;
+        m_primary[i].init(std::max(0.15f, base * (1.0f + spread)), sampleRate,
+                          -0.40f, 0.52f, 0.42f);
         m_primaryGain[i] = 0.94f + 0.03f * static_cast<float>(i % 3);
+        m_bank[i] = i < p.cylinderBank.size()
+                  ? std::clamp(p.cylinderBank[i], 0, static_cast<int>(m_bankCount) - 1)
+                  : 0;
+        m_runnerDcIn[i] = m_runnerDcOut[i] = 0.0f;
+        m_lastIntakeLift[i] = m_lastExhaustLift[i] = m_lastBurn[i] = m_lastKnock[i] = 0.0f;
     }
 
-    m_collector.init(1.05f, sampleRate, -0.42f, 0.52f, 0.34f);
-    m_tailpipe.init(0.72f, sampleRate, -0.34f, 0.48f, 0.26f);
-    m_intakePipe.init(0.40f, sampleRate, -0.60f, 0.85f, 0.50f);
+    const float collectorLen = std::clamp(
+        0.55f + static_cast<float>(p.collectorVolume) * 300.0f, 0.30f, 2.20f);
+    for (std::size_t b = 0; b < m_bankCount; ++b)
+        m_collector[b].init(collectorLen * (1.0f + 0.04f * static_cast<float>(b)),
+                            sampleRate, -0.42f, 0.52f, 0.34f);
 
+    m_tailpipe.init(std::max(0.15f, static_cast<float>(p.tailLength)), sampleRate,
+                    -0.34f, 0.48f, 0.26f);
+    m_intakePipe.init(std::clamp(static_cast<float>(p.intakeRunner.length) + 0.10f,
+                                 0.15f, 0.90f), sampleRate, -0.60f, 0.85f, 0.50f);
+
+    m_mufflerCoef = std::clamp(static_cast<float>(p.mufflerDamping), 0.05f, 0.90f);
+    m_loudness    = std::clamp(static_cast<float>(p.exhaustLoudness), 0.2f, 2.0f);
+
+    // Bigger bores ring lower: the block is what the combustion event shakes.
+    const float thump = std::clamp(320.0f * 0.086f / static_cast<float>(p.bore),
+                                   140.0f, 700.0f);
     m_valveFilter.set(3200.0f, 1.4f, sampleRate);
     m_whirrFilter.set(1800.0f, 0.8f, sampleRate);
-    m_thumpFilter.set(320.0f, 1.1f, sampleRate);
+    m_thumpFilter.set(thump, 1.1f, sampleRate);
+    m_knockFilter.set(5600.0f, 3.0f, sampleRate);
     m_intakeVoice.set(900.0f, 0.9f, sampleRate);
+
+    m_muffler1 = m_muffler2 = m_radPrev = 0.0f;
+    m_intakeDcIn = m_intakeDcOut = m_dcPrevIn = m_dcPrevOut = 0.0f;
 }
 
 float Synth::noise() {
@@ -115,15 +143,19 @@ void Synth::step(const sim::Engine& engine, float gain, float& left, float& righ
     const auto& cyls = engine.cylinders();
     const float rpm = static_cast<float>(engine.rpm());
     const float speedFactor = std::clamp(rpm / 6000.0f, 0.0f, 1.4f);
+    const std::size_t nCyl = std::min(m_cylCount, cyls.size());
 
-    // ---- Exhaust: one primary per cylinder into a shared collector ----------
-    float exhaust = 0.0f;
-    for (std::size_t i = 0; i < m_cylCount; ++i) {
+    // ---- Exhaust: one primary per cylinder, summed within its own bank ------
+    float bankIn[kMaxBanks] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float drive = 0.0f;
+    for (std::size_t i = 0; i < nCyl; ++i) {
         const float raw = static_cast<float>(engine.exhaustRunnerGauge(i)) * 1.0e-4f;
         const float src = raw - m_runnerDcIn[i] + 0.9985f * m_runnerDcOut[i];
         m_runnerDcIn[i]  = raw;
         m_runnerDcOut[i] = src;
-        exhaust += m_primaryGain[i] * m_primary[i].tick(src);
+        const float out = m_primaryGain[i] * m_primary[i].tick(src);
+        bankIn[m_bank[i] % kMaxBanks] += out;
+        drive += out;
 
         // ---- Mechanical events ---------------------------------------------
         const sim::Cylinder& c = cyls[i];
@@ -144,14 +176,23 @@ void Synth::step(const sim::Engine& engine, float gain, float& left, float& righ
         if (burn > 0.02f && m_lastBurn[i] <= 0.02f)
             m_combustionBurst.trigger(0.35f, 0.9988f);
         m_lastBurn[i] = burn;
+
+        // Detonation is not a louder combustion event, it is a different one:
+        // a hard, bright ring as the end gas goes off against the chamber.
+        const float knock = static_cast<float>(c.knockShock);
+        if (knock > 0.05f && m_lastKnock[i] <= 0.05f)
+            m_knockBurst.trigger(0.30f + 0.55f * knock, 0.9975f);
+        m_lastKnock[i] = knock;
     }
 
-    float x = m_collector.tick(exhaust * 0.5f);
+    float exhaust = 0.0f;
+    for (std::size_t b = 0; b < m_bankCount; ++b)
+        exhaust += m_collector[b].tick(bankIn[b] * 0.5f);
 
     // Muffler: two cascaded poles, then the tailpipe's own resonance.
-    m_muffler1 += 0.34f * (x - m_muffler1);
-    m_muffler2 += 0.34f * (m_muffler1 - m_muffler2);
-    x = m_tailpipe.tick(m_muffler2);
+    m_muffler1 += m_mufflerCoef * (exhaust - m_muffler1);
+    m_muffler2 += m_mufflerCoef * (m_muffler1 - m_muffler2);
+    float x = m_tailpipe.tick(m_muffler2);
 
     // Radiation from an open pipe follows the rate of change of the wave rather
     // than the wave itself. Mixing in some of that derivative is what puts the
@@ -175,6 +216,7 @@ void Synth::step(const sim::Engine& engine, float gain, float& left, float& righ
     const float n = noise();
     const float valves = m_valveFilter.band(m_valveBurst.tick(n));
     const float thump  = m_thumpFilter.band(m_combustionBurst.tick(n));
+    const float det    = m_knockFilter.band(m_knockBurst.tick(n));
     const float whirr  = m_whirrFilter.band(n) * 0.012f * speedFactor;
 
     // ---- Level --------------------------------------------------------------
@@ -188,11 +230,11 @@ void Synth::step(const sim::Engine& engine, float gain, float& left, float& righ
     // The estimate follows what actually drives the pipes - the summed primary
     // output - rather than the collector's absolute pressure, most of which is
     // steady backpressure and radiates nothing.
-    m_level += (std::abs(exhaust) - m_level) * 2.5e-5f;   // ~1 s window
+    m_level += (std::abs(drive) - m_level) * 2.5e-5f;   // ~1 s window
     const float taper = std::clamp(0.105f * std::pow(std::max(m_level, 1.0e-4f), -0.25f),
                                    0.02f, 6.0f);
 
-    float body = x * taper;
+    float body = x * taper * m_loudness;
 
     // Block the standing pressure offset: only the fluctuation radiates.
     const float dc = body - m_dcPrevIn + 0.997f * m_dcPrevOut;
@@ -200,7 +242,8 @@ void Synth::step(const sim::Engine& engine, float gain, float& left, float& righ
     m_dcPrevOut = dc;
     body = saturate(dc);
 
-    const float mono = body + valves * 0.10f + thump * 0.17f + whirr * 0.35f + intake * 0.10f;
+    const float mono = body + valves * 0.10f + thump * 0.17f + det * 0.22f +
+                       whirr * 0.35f + intake * 0.10f;
 
     // ---- Stereo -------------------------------------------------------------
     // The tailpipe is behind and to one side, the intake ahead of the other
@@ -217,13 +260,34 @@ void Synth::step(const sim::Engine& engine, float gain, float& left, float& righ
 // ---------------------------------------------------------------------------
 EngineSound::EngineSound(sim::Engine& engine) : m_engine(engine) {
     m_buffer.resize(kChunk * 2);        // stereo, interleaved
-    m_synth.init(engine.cylinders().size(), static_cast<float>(kSampleRate));
+    m_synth.init(engine.params(), static_cast<float>(kSampleRate));
     for (auto& s : m_scope) s.store(0.0f, std::memory_order_relaxed);
     initialize(2, kSampleRate, {sf::SoundChannel::FrontLeft, sf::SoundChannel::FrontRight});
 }
 
+bool EngineSound::requestConfig(const sim::EngineParams& p, const sim::DrivetrainParams& t) {
+    if (configPending()) return false;      // the audio thread has not read the last one
+    const int spare = 1 - m_cfgIndex.load(std::memory_order_relaxed);
+    m_cfgParams[spare] = p;
+    m_cfgDrive[spare]  = t;
+    m_cfgIndex.store(spare, std::memory_order_release);
+    m_configGen.fetch_add(1, std::memory_order_release);
+    return true;
+}
+
 bool EngineSound::onGetData(Chunk& chunk) {
     const double dt = 1.0 / kSampleRate;
+
+    // A pending specification is applied here, on the thread that owns the
+    // engine, at a chunk boundary - never mid-buffer.
+    const unsigned gen = m_configGen.load(std::memory_order_acquire);
+    if (gen != m_configAck.load(std::memory_order_relaxed)) {
+        const int slot = m_cfgIndex.load(std::memory_order_acquire);
+        m_engine.reconfigure(m_cfgParams[slot]);
+        m_engine.drivetrain().setParams(m_cfgDrive[slot]);
+        m_synth.init(m_cfgParams[slot], static_cast<float>(kSampleRate));
+        m_configAck.store(gen, std::memory_order_release);
+    }
 
     m_engine.setThrottle(m_throttle.load(std::memory_order_relaxed));
     m_engine.setStarter(m_starterCmd.load(std::memory_order_relaxed));
