@@ -159,6 +159,7 @@ void Engine::rebuild(bool preserveMotion) {
     m_boostPressure = Thermo::pAmb;
     m_boostTemp     = Thermo::tAmb;
     m_knockLevel = m_knockRetard = 0.0;
+    m_knockFuelTerm = 17.68e-3 * std::pow(std::max(m_p.fuel.octane, 40.0) * 0.01, 3.402);
 
     m_cyl.assign(static_cast<std::size_t>(m_p.cylinders), Cylinder{});
     for (std::size_t i = 0; i < m_cyl.size(); ++i) {
@@ -176,15 +177,30 @@ void Engine::rebuild(bool preserveMotion) {
         c.exRunnerMass   = Thermo::pAmb * exRunnerVol / (Thermo::R * Thermo::tAmb);
         c.exRunnerEnergy = c.exRunnerMass * Thermo::energy(Thermo::tAmb, 1.0);
         c.exRunnerBurned = c.exRunnerMass;
+
+        c.intakeWave.configure(m_p.intakeRunner.length, m_p.intakeRunner.area,
+                               m_p.intakeReflect, m_p.waveDamping, m_p.waveStrength);
+        c.exhaustWave.configure(m_p.exhaustRunner.length, m_p.exhaustRunner.area,
+                                m_p.exhaustReflect, m_p.waveDamping, m_p.waveStrength);
     }
 
     m_plenumMass   = Thermo::pAmb * m_p.plenumVolume / (Thermo::R * Thermo::tAmb);
     m_plenumEnergy = m_plenumMass * Thermo::energy(Thermo::tAmb, 0.0);
     m_plenumBurned = 0.0;
 
-    m_collectorMass   = Thermo::pAmb * m_p.collectorVolume / (Thermo::R * Thermo::tAmb);
-    m_collectorEnergy = m_collectorMass * Thermo::energy(Thermo::tAmb, 1.0);
-    m_collectorBurned = m_collectorMass;
+    // Each bank gets its own collector, and they share the volume the design
+    // asks for rather than each getting all of it.
+    m_bankCount = std::clamp(static_cast<std::size_t>(std::max(1, m_p.exhaustBanks)),
+                             std::size_t{1}, kMaxBanks);
+    m_collectorVolEach = std::max(1.0e-5, m_p.collectorVolume / static_cast<double>(m_bankCount));
+    for (std::size_t b = 0; b < kMaxBanks; ++b) {
+        m_collectorMass[b]     = Thermo::pAmb * m_collectorVolEach / (Thermo::R * Thermo::tAmb);
+        m_collectorEnergy[b]   = m_collectorMass[b] * Thermo::energy(Thermo::tAmb, 1.0);
+        m_collectorBurned[b]   = m_collectorMass[b];
+        m_collectorTemp[b]     = Thermo::tAmb;
+        m_collectorPressure[b] = Thermo::pAmb;
+        m_collectorWall[b]     = Thermo::tAmb;
+    }
 
     if (!preserveMotion)
         for (auto& t : m_trace) t.store(0.0f, std::memory_order_relaxed);
@@ -212,23 +228,29 @@ double Engine::lookupLift(const std::vector<double>& table, double phaseDeg) {
     return table[i] * (1.0 - f) + table[j] * f;
 }
 
-double Engine::cylinderVolume(double phaseDeg) const {
-    const double th = phaseDeg * kDegRad;
-    const double a  = 0.5 * m_p.stroke;
-    const double l  = m_p.rodLength;
-    const double s  = a * std::sin(th);
-    const double x  = a * std::cos(th) + std::sqrt(l * l - s * s);
+double Engine::volumeFromTrig(double sinTh, double cosTh) const {
+    const double a = 0.5 * m_p.stroke;
+    const double l = m_p.rodLength;
+    const double s = a * sinTh;
+    const double x = a * cosTh + std::sqrt(l * l - s * s);
     return m_clearance + m_pistonArea * (l + a - x);
 }
 
-double Engine::dVolumeDTheta(double phaseDeg) const {
-    const double th   = phaseDeg * kDegRad;
+double Engine::cylinderVolume(double phaseDeg) const {
+    const double th = phaseDeg * kDegRad;
+    return volumeFromTrig(std::sin(th), std::cos(th));
+}
+
+double Engine::dVolumeFromTrig(double st, double ct) const {
     const double a    = 0.5 * m_p.stroke;
     const double l    = m_p.rodLength;
-    const double st   = std::sin(th);
-    const double ct   = std::cos(th);
     const double root = std::sqrt(l * l - a * a * st * st);
     return m_pistonArea * a * (st + a * st * ct / root);
+}
+
+double Engine::dVolumeDTheta(double phaseDeg) const {
+    const double th = phaseDeg * kDegRad;
+    return dVolumeFromTrig(std::sin(th), std::cos(th));
 }
 
 double Engine::portArea(const ValveTiming& v, double lift) const {
@@ -420,9 +442,9 @@ void Engine::step(double dt) {
         return Node{&m_plenumMass, &m_plenumEnergy, &m_plenumBurned,
                     m_plenumPressure, m_plenumTemp, y};
     };
-    auto collector = [&] {
-        return Node{&m_collectorMass, &m_collectorEnergy, &m_collectorBurned,
-                    m_collectorPressure, m_collectorTemp, 1.0};
+    auto collector = [&](std::size_t b) {
+        return Node{&m_collectorMass[b], &m_collectorEnergy[b], &m_collectorBurned[b],
+                    m_collectorPressure[b], m_collectorTemp[b], 1.0};
     };
 
     // ---- Throttle: upstream <-> plenum --------------------------------------
@@ -514,6 +536,23 @@ void Engine::step(double dt) {
     const double loadForMix = std::clamp(loadFrac, 0.0, 1.0);
     m_lambda = m_p.lambdaCruise + (m_p.lambdaPower - m_p.lambdaCruise) *
                                   std::clamp((loadFrac - 0.55) / 0.45, 0.0, 1.0);
+
+    // A carburettor is not told what to deliver: it meters fuel by the
+    // depression a venturi makes, which goes with the square of airflow while
+    // the fuel it draws goes more nearly linearly, so it richens as it is asked
+    // for more. Nothing corrects it, and the mixture wanders with speed as well
+    // as load. Injection holds the number it was given.
+    if (m_p.fuelSystem == 0) {
+        const double flowFrac = std::clamp(loadFrac * rpm() / std::max(m_p.redline, 1.0),
+                                           0.0, 1.2);
+        m_lambda *= 1.0 - 0.16 * flowFrac;              // richens with flow
+        // ... and goes lean the instant the throttle is opened, because the air
+        // arrives before the fuel film in the port does.
+        const double opening = std::max(0.0, m_throttle - m_throttleLagged);
+        m_throttleLagged += (m_throttle - m_throttleLagged) * std::min(1.0, 6.0 * dt);
+        m_lambda *= 1.0 + 0.9 * opening;
+        m_lambda = std::clamp(m_lambda, 0.62, 1.35);
+    }
     m_afr = m_lambda * m_p.fuel.stoichAfr;
 
     // Knock feedback. A knock sensor cannot tell the ECU how to avoid knock,
@@ -583,7 +622,13 @@ void Engine::step(double dt) {
         c.phase = wrap720(m_crankAngle + offset);
 
         const double Vprev = c.volume;
-        c.volume = cylinderVolume(c.phase);
+        // Volume, its derivative and the reciprocating inertia all want the
+        // sine and cosine of the same angle. At twelve cylinders and six
+        // sub-steps a sample that is a lot of trigonometry to repeat.
+        const double th = c.phase * kDegRad;
+        const double sinTh = std::sin(th);
+        const double cosTh = std::cos(th);
+        c.volume = volumeFromTrig(sinTh, cosTh);
         const double dV = c.volume - Vprev;
 
         c.intakeLift  = lookupLift(m_intakeLift, c.phase + m_camAdvance) * liftScale;
@@ -630,9 +675,13 @@ void Engine::step(double dt) {
             c.runnerEnergy -= intoRunner * coolPerKgAir;
 
         const double rhoEx = c.exRunnerPressure / (Thermo::R * c.exRunnerTemp);
-        accelerate(c.exhaustFlowRate, c.exRunnerPressure, m_collectorPressure,
+        const std::size_t bank = ci < m_p.cylinderBank.size()
+                               ? std::min(static_cast<std::size_t>(std::max(0, m_p.cylinderBank[ci])),
+                                          m_bankCount - 1)
+                               : 0;
+        accelerate(c.exhaustFlowRate, c.exRunnerPressure, m_collectorPressure[bank],
                    rhoEx, m_p.exhaustRunner);
-        convect(exRunNode(), collector(), c.exhaustFlowRate);
+        convect(exRunNode(), collector(bank), c.exhaustFlowRate);
         pipeLoss(c.exRunnerEnergy, c.exRunnerMass, c.exRunnerTemp, c.exWallTemp,
                  m_exRunnerWallArea, c.exhaustFlowRate);
 
@@ -646,9 +695,30 @@ void Engine::step(double dt) {
         };
         refreshRunner();
 
+        // ---- Travelling waves -------------------------------------------------
+        // Each port launches a wave into its runner and hears one come back a
+        // round trip later. What returns is added to the static runner pressure
+        // when the valves are worked out below, so a pipe's *length* decides
+        // when it helps - the extraction pulse that scavenges an exhaust port,
+        // and the returning compression that rams an intake one.
+        {
+            const double cIn = std::sqrt(1.4 * Thermo::R * std::max(120.0, c.runnerTemp));
+            const double cEx = std::sqrt(1.33 * Thermo::R * std::max(120.0, c.exRunnerTemp));
+            // Flow into the pipe at the valve: the exhaust is blown into, the
+            // intake is drawn out of, and the sign of the launched wave follows.
+            c.intakeWavePa  = c.intakeWave.step(dt, -c.valveFlowIntake, cIn,
+                                                c.runnerPressure);
+            c.exhaustWavePa = c.exhaustWave.step(dt, c.valveFlowExhaust, cEx,
+                                                 c.exRunnerPressure);
+        }
+
         // ---- Valves ----------------------------------------------------------
-        const double intoCyl = exchange(runNode(), cylNode(), aInt);
-        const double outCyl  = -exchange(exRunNode(), cylNode(), aExh);
+        Node runPort = runNode();
+        Node exPort  = exRunNode();
+        runPort.p = std::max(500.0, runPort.p + c.intakeWavePa);
+        exPort.p  = std::max(500.0, exPort.p + c.exhaustWavePa);
+        const double intoCyl = exchange(runPort, cylNode(), aInt);
+        const double outCyl  = -exchange(exPort, cylNode(), aExh);
         c.valveFlowIntake  = intoCyl;
         c.valveFlowExhaust = outCyl;
         if (intoCyl > 0.0) {
@@ -765,8 +835,9 @@ void Engine::step(double dt) {
                 c.refTemp * std::pow(c.pressure / std::max(c.refPressure, 1.0e4), 0.2857),
                 300.0, 1400.0);
             const double pAtm = c.pressure / 101325.0;
-            double tau = 17.68e-3 * std::pow(std::max(m_p.fuel.octane, 40.0) * 0.01, 3.402) *
-                         std::pow(pAtm, -1.7) * std::exp(3800.0 / tu);
+            // The octane term depends on nothing that changes while running, so
+            // it is worked out once when the engine is built.
+            double tau = m_knockFuelTerm * std::pow(pAtm, -1.7) * std::exp(3800.0 / tu);
             // Knock resistance is a bowl, not a slope. It is worst just lean of
             // stoichiometric, where the flame is hottest; enrichment cools the
             // charge, and running properly lean drops peak temperature far
@@ -827,15 +898,17 @@ void Engine::step(double dt) {
 
         // Gas torque: dW = p dV, so tau = p dV/dtheta. The underside of the
         // piston sits at crankcase (ambient) pressure, hence the offset.
-        gasTorque += (c.pressure - Thermo::pAmb) * dVolumeDTheta(c.phase);
+        gasTorque += (c.pressure - Thermo::pAmb) * dVolumeFromTrig(sinTh, cosTh);
 
         // Reciprocating inertia: the piston and small end have to be stopped
         // and restarted twice a revolution. It integrates to zero over a cycle
         // but is what gives the crank its within-cycle speed ripple.
         {
-            const double th = c.phase * kDegRad;
-            const double dx  = -a * std::sin(th) - (a * a / (2.0 * l)) * std::sin(2.0 * th);
-            const double ddx = -a * std::cos(th) - (a * a / l) * std::cos(2.0 * th);
+            // Double-angle identities rather than two more trig calls.
+            const double sin2 = 2.0 * sinTh * cosTh;
+            const double cos2 = 1.0 - 2.0 * sinTh * sinTh;
+            const double dx  = -a * sinTh - (a * a / (2.0 * l)) * sin2;
+            const double ddx = -a * cosTh - (a * a / l) * cos2;
             inertiaTorque -= m_p.recipMass * m_omega * m_omega * dx * ddx;
         }
 
@@ -871,18 +944,26 @@ void Engine::step(double dt) {
     // to be pushed through it: that restriction is the price of the boost.
     {
         Node amb = ambientNode(1.0);
-        const double outlet = m_p.outletArea *
+        // Each bank vents through its share of the outlet.
+        const double outlet = m_p.outletArea / static_cast<double>(m_bankCount) *
                               (m_p.charger == 1 ? std::clamp(m_p.turbineRestrict, 0.2, 1.0) : 1.0);
-        exchange(collector(), amb, outlet);
+        for (std::size_t b = 0; b < m_bankCount; ++b) {
+            Node amb2 = amb;
+            exchange(collector(b), amb2, outlet);
+        }
     }
-    m_collectorMass = std::max(m_collectorMass, 1e-9);
-    m_collectorTemp = Thermo::temperature(m_collectorEnergy / m_collectorMass, 1.0);
-    // Everything the engine breathes passes through the collector, so its own
-    // throughput is what sets the film coefficient there.
-    pipeLoss(m_collectorEnergy, m_collectorMass, m_collectorTemp, m_collectorWall,
-             m_collectorWallArea, m_throttleFlow);
-    m_collectorTemp = Thermo::temperature(m_collectorEnergy / m_collectorMass, 1.0);
-    m_collectorPressure = m_collectorMass * Thermo::R * m_collectorTemp / m_p.collectorVolume;
+    for (std::size_t b = 0; b < m_bankCount; ++b) {
+        m_collectorMass[b] = std::max(m_collectorMass[b], 1e-9);
+        m_collectorTemp[b] = Thermo::temperature(m_collectorEnergy[b] / m_collectorMass[b], 1.0);
+        // Everything a bank breathes passes through its collector, so that
+        // bank's own share of the throughput sets the film coefficient.
+        pipeLoss(m_collectorEnergy[b], m_collectorMass[b], m_collectorTemp[b],
+                 m_collectorWall[b], m_collectorWallArea / static_cast<double>(m_bankCount),
+                 m_throttleFlow / static_cast<double>(m_bankCount));
+        m_collectorTemp[b] = Thermo::temperature(m_collectorEnergy[b] / m_collectorMass[b], 1.0);
+        m_collectorPressure[b] = m_collectorMass[b] * Thermo::R * m_collectorTemp[b] /
+                                 m_collectorVolEach;
+    }
 
     // ---- Oil -----------------------------------------------------------------
     // Oil warms towards a load-dependent temperature, and its viscosity there
@@ -970,8 +1051,8 @@ Snapshot Engine::snapshot() const {
     s.brake            = static_cast<float>(m_drive.brake());
     s.crankAngle       = static_cast<float>(m_crankAngle);
     s.peakPressure     = static_cast<float>(m_peakPressure);
-    s.exhaustTemp      = static_cast<float>(m_collectorTemp);
-    s.backPressure     = static_cast<float>(m_collectorPressure * 0.001);
+    s.exhaustTemp      = static_cast<float>(m_collectorTemp[0]);
+    s.backPressure     = static_cast<float>(m_collectorPressure[0] * 0.001);
     s.volumetricEff    = static_cast<float>(m_volEff);
     s.residualFraction = static_cast<float>(m_residual);
     s.sparkAdvance     = static_cast<float>(m_sparkAdvance);

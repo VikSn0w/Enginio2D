@@ -16,6 +16,11 @@ struct DrivetrainParams {
     double lockRpm      = 1300.0;  // clutch fully home above this
     double slipRpm      = 550.0;   // below this it is fully open, so no stalling
     double brakeTorque  = 2600.0;  // N m at the wheels, full brake
+    // Traction. Wheel torque only becomes acceleration while the tyres can
+    // hold it: beyond that they spin, which is why first gear in anything
+    // quick is a question of grip rather than of power.
+    double tyreGrip     = 1.05;    // peak friction coefficient
+    double driveShare   = 0.52;    // fraction of weight over the driven wheels
 };
 
 // Clutch, gearbox and vehicle. The clutch is a slipping friction coupling
@@ -49,6 +54,7 @@ public:
     double clutchLock() const  { return m_clutch; }              // 0..1
     double slip() const        { return m_slip; }                // rad/s
     double wheelTorque() const { return m_wheelTorque; }         // N m
+    double wheelSlip() const   { return m_wheelSlip; }           // 0 = gripping, 1 = spinning
     double brake() const       { return m_brake; }
     bool   shifting() const    { return m_shiftTimer > 0.0; }
     // Crank speed the gearing implies for the current road speed.
@@ -64,6 +70,7 @@ private:
     double m_clutch     = 0.0;
     double m_slip       = 0.0;
     double m_wheelTorque= 0.0;
+    double m_wheelSlip  = 0.0;
     double m_inputOmega = 0.0;
     double m_shiftTimer = 0.0;
 };

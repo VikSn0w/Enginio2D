@@ -29,9 +29,20 @@ add_executable(Enginio2D
         src/sim/Dyno.cpp
         src/audio/EngineSound.cpp
         src/ui/Widgets.cpp
+        src/ui/FileBrowser.cpp
         src/ui/Editor.cpp
 )
 target_include_directories(Enginio2D PRIVATE src)
+
+# Regression harness: dynos every preset and compares against tools/baselines.txt.
+# It needs no window and no audio device, so it can run anywhere.
+add_executable(enginio_validate
+        tools/validate.cpp
+        src/sim/Engine.cpp
+        src/sim/EngineDesign.cpp
+        src/sim/Drivetrain.cpp
+)
+target_include_directories(enginio_validate PRIVATE src)
 target_link_libraries(Enginio2D PRIVATE SFML::Graphics SFML::Audio SFML::Window SFML::System)
 
 # SFML ships as DLLs: put them next to the executable.

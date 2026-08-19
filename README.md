@@ -38,6 +38,7 @@ too — an unoptimised build will not keep up with the audio thread.
 | `Q` / `E` | shift down / up |
 | `0`-`8`, `N` | select gear directly (0 or N is neutral) |
 | `I` | ignition on/off |
+| `F11` | fullscreen |
 | `Esc` | quit |
 
 Hold `S` for a moment, and it fires and settles to idle. Select first with `1`,
@@ -66,30 +67,79 @@ Nine tabs, grouped the way an engine is actually specified:
   the valves stop following the cam.
 - **Fuel & spark** — twelve fuels, spark maps, burn duration, ignition delay,
   lambda at light and full load, knock control, redline and idle speed.
-- **Oil & friction** — grade, running and start temperature, friction scale,
-  accessory drag.
+- **Fuel & spark** also carries the **fuelling system**: a carburettor meters on
+  airflow and richens as that rises, with no correction and a lean spot the
+  instant the throttle opens; injection holds the lambda it is given; direct
+  injection holds it and evaporates the whole charge in the bore.
+- **Cooling, oil & friction** — liquid, air or oil cooling; grade, running and
+  start temperature, friction scale, accessory drag. Air cooling runs the
+  chamber walls far hotter, which costs charge density and power per litre.
 - **Induction** — throttle bore, plenum volume, runner length and diameter,
   and a turbo, roots blower or centrifugal blower with boost, spool, lag and
-  intercooler effectiveness. The ram-tuned speed of the runner is reported.
+  intercooler effectiveness. It reports how long the runner's wave takes to
+  return, in milliseconds and in crank degrees at the redline.
 - **Exhaust** — header style, primary length and diameter, collector volume,
   and muffler. Both flow and sound follow.
 - **Drivetrain** — up to eight ratios, final drive, and the car: mass, drag
-  area, wheel radius, clutch capacity, brakes. Top speed per gear is listed.
+  area, wheel radius, clutch capacity, brakes, tyre grip and how much of the
+  weight sits over the driven wheels. Torque beyond what the contact patch can
+  hold spins the tyre instead of accelerating anything. Top speed per gear is
+  listed.
 - **Appearance** — theme, accent hue, block and cam-cover colour, and which
   views to show. These apply instantly and never rebuild the engine.
 
-Twelve **presets** ship with it, from a stock 2.0 four to a crossplane V8, a
+Thirteen **presets** ship with it, from a stock 2.0 four to a crossplane V8, a
 600cc superbike, a blown methanol drag motor, a turbo diesel, a 45-degree
-V-twin and a hydrogen six. **Save** writes `designs/<name>.eng`, one field per
-line, so a design can be read, diffed and hand-edited; **Open** loads any file
-found there.
+V-twin, a 1993 Ducati Monster 900 and a hydrogen six.
 
-### The dynamometer
+They are **files, not code**: `presets/*.json`, read at startup in filename
+order, which is why they are numbered. Edit one in a text editor, drop a new one
+in the folder, or send one to somebody - no rebuild involved. The compiled-in
+table is kept only as a fallback for a build that cannot find the directory, and
+the editor says which it is using. Regenerate the files from that table with
+
+```
+build\enginio_validate.exe --export-presets presets
+```
+
+A design is one flat JSON object, one field per line, so it reads, diffs and
+hand-edits cleanly and anything else can generate one:
+
+```json
+{
+  "format": "enginio2d-design",
+  "version": 1,
+  "name": "Ducati Monster 900 (1993)",
+  "bore": 92,
+  "stroke": 68,
+  ...
+  "gears": [2.466, 1.765, 1.35, 1.091, 0.958, 0.857, 0.8, 0.75]
+}
+```
+
+There is no preset dropdown any more - it was a second way of opening the same
+files, kept in its own order and needing its own list. The editor header shows
+the engine's title instead, and **PRESETS** and **DESIGNS** open the browser in
+either folder. In the listing each file shows the title the engine gives itself
+alongside its filename, so the list reads as engines rather than as paths.
+
+**FILES** opens a browser over the editor: it walks directories, shows sizes and
+dates, and opens, saves, deletes and makes folders. Designs go in `designs/` by
+default and presets live next door in `presets/`, but both are just paths and
+you can keep engines wherever you like. Older key-per-line `.eng` files still
+load.
+
+### The dynamometer and the part-load map
 
 **Dyno pull** sweeps a private copy of the engine on a worker thread, holding
 each speed with an ideal brake at wide-open throttle, waiting for the manifold,
 the pipes and the turbo to settle, and averaging the torque the brake absorbs.
 The curve draws itself as the sweep runs.
+
+**Part load** sweeps speed against throttle opening instead, and records what
+the engine burns in each cell. Wide-open throttle is not where anything is
+driven; this is the map an engine is actually judged on - where the efficient
+island sits and how big it is.
 
 This is the honest answer to "how much power does it make": power is not a
 number you set, it is what the geometry, the cam, the fuel and the boost add up
@@ -97,14 +147,34 @@ to. What the presets produce:
 
 | Preset | Peak power | Peak torque |
 | --- | --- | --- |
-| Stock 2.0 inline-4 | 86 kW at 5600 | 192 N m at 3000 |
-| Turbo 2.0 inline-4 | 185 kW at 5600 | 392 N m at 2400 |
-| Crossplane 5.0 V8 | 222 kW at 5700 | 495 N m at 3300 |
-| Flat-plane 4.5 V8 | 284 kW at 7300 | 448 N m at 3200 |
-| Race 6.0 V12 | 391 kW at 7900 | 552 N m at 3500 |
-| Blown methanol 7.0 V8 | 607 kW at 4800 | 1524 N m at 2100 |
-| 3.0 inline-6 turbo diesel | 184 kW at 4600 | 471 N m at 1700 |
-| 600cc inline-4 superbike | 70 kW at 14400 | 58 N m at 10100 |
+| Stock 2.0 inline-4 | 92 kW at 5800 | 200 N m at 3100 |
+| Turbo 2.0 inline-4 | 198 kW at 5800 | 419 N m at 3000 |
+| Crossplane 5.0 V8 | 238 kW at 5900 | 505 N m at 3300 |
+| Flat-plane 4.5 V8 | 314 kW at 8000 | 445 N m at 3000 |
+| Race 6.0 V12 | 423 kW at 7800 | 568 N m at 3000 |
+| Blown methanol 7.0 V8 | 616 kW at 5100 | 1497 N m at 2000 |
+| 3.0 inline-6 turbo diesel | 191 kW at 4600 | 466 N m at 1400 |
+| 600cc inline-4 superbike | 76 kW at 13600 | 61 N m at 9700 |
+| 45 degree V-twin cruiser | 40 kW at 3000 | 158 N m at 1400 |
+| Ducati Monster 900 (1993) | 52 kW at 7100 | 77 N m at 5400 |
+
+The Ducati is the one preset built against a workshop manual rather than from
+general knowledge, and it is the one worth checking. The manual gives 55 kW
+(73.7 CV) at 7000 rpm; the preset makes 52 kW and peaks at 7100. Torque comes
+out at 77 N m against a published 76, peaking at 5400 where the real engine
+peaks at 6000.
+
+The geometry is the manual's exactly: 92 x 68 mm, 9.2:1, 43 and 38 mm valves,
+11.76 and 10.56 mm of lift, a 109.5 degree lobe separation, two 38 mm Mikuni
+BDST carburettors, air cooled. What is not the manual's is the cam *duration*,
+and the reason is worth recording. The book quotes timing twice, measured with
+0.20 mm and with 1 mm of valve clearance - 308 and 260 degrees for the same
+cam. A desmo profile spends a long time barely off its seat flowing almost
+nothing, while the smooth hump this simulation uses carries real area
+everywhere it is open. Feed it the seat-to-seat numbers and the overlap
+breathes far too well; feed it the 1 mm numbers and the top end suffocates. The
+effective duration is between the two, and 285 degrees is the value in that
+bracket that puts peak power where the manual puts it.
 
 The drivetrain tab also reports the **drag-limited top speed**, so the per-gear
 speeds at the limiter can be read for what they are. A top gear taller than the
@@ -128,10 +198,16 @@ combustion products), integrated in crank angle:
   flow-bench data, choked below the critical pressure ratio. Both directions
   are modelled, so reversion and overlap backflow happen on their own. Cam
   profiles are baked into a 0.1 degree lift table when the engine is built.
-- **Runners** are inertances, not restrictions: each intake and exhaust port
-  has a gas column with momentum plus a small volume, so the charge rams and
-  the exhaust extracts. This is what produces VE near 1.0 at the torque peak
-  and the fall-off either side of it.
+- **Runners** are inertances *and* waves. The lumped column - momentum plus a
+  small volume - carries the mass and gets steady flow right, but it has no
+  length in time, so nothing it does can depend on when a pulse arrives back.
+  A delay line alongside it carries exactly that: the port launches
+  `p+ = c mdot / A`, the far end returns it inverted a round trip `2L/c` later,
+  and what comes back is added to the runner pressure the valves see. That is
+  the whole of exhaust scavenging and most of intake ram, and it is why pipe
+  *length* moves the torque peak instead of merely changing a volume. Only the
+  transient part of the port flow is propagated - the lumped column already
+  holds the quasi-steady part, and propagating both counts it twice.
 - **Combustion** as a Wiebe function (a = 5, m = 2) burning only the *fresh*
   part of the charge, with an ignition delay and a burn duration that
   lengthens with speed, with dilution, and with distance from the mixture that
@@ -321,10 +397,40 @@ over the 720 degree cycle with the overlap shaded, the phaser position applied
 and a cursor at the current angle, the cylinder pressure trace, and the exhaust
 waveform.
 
+## Checking it still works
+
+`enginio_validate` dynos every preset, leaves each one idling on its own, and
+compares the result against `tools/baselines.txt`. It needs no window and no
+audio device.
+
+```
+build\enginio_validate.exe            check, and return non-zero if anything moved
+build\enginio_validate.exe --update   record current behaviour as the baseline
+```
+
+This exists because almost everything here is a coupled feedback loop and a
+local-looking change is not: adding the runner wave model turned every engine
+into a supercharger at every speed, and nothing in the diff said so. Regenerate
+the baselines when a change is an improvement and put the diff in the commit -
+it is the clearest statement of what the change actually did.
+
 ## Known gaps
 
-- Runners are lumped inertances, not a 1D wave solver, so they capture ram and
-  extraction but not the higher harmonics of real pipe tuning.
+- **Torque peaks too low, and runner length will not fix it.** Most presets
+  peak torque between 2800 and 3400 rpm where the real engines they name peak
+  nearer 4000-5000. Sweeping intake runner length from 110 to 400 mm moves the
+  torque peak not at all - the stock four peaks at 3440 rpm at every length -
+  while it does move the *power* peak substantially (5520 rpm at 300 mm, 6213
+  at 110 mm) and trades peak torque against it. So the peak is pinned by cam
+  timing and how volumetric efficiency falls with speed, not by the runners.
+  Fitting short runners to every preset would flatter the numbers at the cost
+  of describing engines that do not exist, so the presets keep realistic
+  lengths and this stays on the list.
+- The runner waves are a single reflection on a delay line, not a 1D gas
+  dynamics solver: they place the first echo correctly and get its sign right,
+  but they do not carry the higher harmonics, the entropy waves, or the
+  reflection off a second area change. The wave amplitude carries a calibration
+  factor for the same reason.
 - The gas dynamics run one exhaust collector regardless of layout; the split
   into per-bank collectors exists only in the sound synthesis.
 - No blowby and no crevice volumes; Woschni carries a calibration multiplier to

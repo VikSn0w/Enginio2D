@@ -159,11 +159,26 @@ void Ui::beginScroll(const sf::FloatRect& area, float& scroll, float contentHeig
     scroll = std::clamp(scroll, 0.0f, maxScroll);
 
     m_savedView = m_rt->getView();
-    const sf::Vector2f size(static_cast<float>(m_rt->getSize().x),
-                            static_cast<float>(m_rt->getSize().y));
+
+    // The clip region is a viewport, which is a fraction of the *window*, but
+    // `area` is in design coordinates. Those two only coincide when the window
+    // happens to be exactly the size of the design space - at any other size,
+    // and most obviously in fullscreen, dividing design coordinates by the pixel
+    // size puts every scrolling region in the wrong place and at the wrong
+    // scale. So the rectangle is mapped through the view that is already
+    // active, which is what carries the letterboxing.
+    const sf::FloatRect base = m_savedView.getViewport();
+    const sf::Vector2f visible = m_savedView.getSize();
+    const sf::Vector2f origin(m_savedView.getCenter().x - visible.x * 0.5f,
+                              m_savedView.getCenter().y - visible.y * 0.5f);
+    const sf::Vector2f scale(visible.x > 1e-3f ? base.size.x / visible.x : 0.0f,
+                             visible.y > 1e-3f ? base.size.y / visible.y : 0.0f);
+
     sf::View v(sf::FloatRect({area.position.x, area.position.y + scroll}, area.size));
-    v.setViewport(sf::FloatRect({area.position.x / size.x, area.position.y / size.y},
-                                {area.size.x / size.x, area.size.y / size.y}));
+    v.setViewport(sf::FloatRect(
+        {base.position.x + (area.position.x - origin.x) * scale.x,
+         base.position.y + (area.position.y - origin.y) * scale.y},
+        {area.size.x * scale.x, area.size.y * scale.y}));
     m_rt->setView(v);
     m_clipping = true;
     m_clipRect = area;

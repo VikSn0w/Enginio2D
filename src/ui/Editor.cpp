@@ -27,12 +27,6 @@ std::string fmt(const char* spec, double v) {
     return buf;
 }
 
-const char* const* presetNameList() {
-    static std::vector<const char*> names;
-    if (names.empty())
-        for (int i = 0; i < sim::presetCount(); ++i) names.push_back(sim::presetName(i));
-    return names.data();
-}
 
 std::string sanitise(const std::string& s) {
     std::string out;
@@ -51,22 +45,6 @@ void Editor::status(const std::string& s, float seconds) {
     m_statusTimer = seconds;
 }
 
-void Editor::refreshSaved() {
-    m_saved.clear();
-    std::error_code ec;
-    std::filesystem::create_directory("designs", ec);
-    for (const auto& e : std::filesystem::directory_iterator("designs", ec)) {
-        if (!e.is_regular_file(ec)) continue;
-        if (e.path().extension() != ".eng") continue;
-        m_saved.push_back(e.path().stem().string());
-    }
-    std::sort(m_saved.begin(), m_saved.end());
-    m_savedPtrs.clear();
-    for (const std::string& s : m_saved) m_savedPtrs.push_back(s.c_str());
-    if (m_savedPtrs.empty()) m_savedPtrs.push_back("(none saved yet)");
-    m_savedPick = std::clamp(m_savedPick, 0, static_cast<int>(m_savedPtrs.size()) - 1);
-    m_savedListed = true;
-}
 
 // ---------------------------------------------------------------------------
 void Editor::tab(Ui& ui, int index, const char* name, float x, float& y) {
@@ -79,7 +57,6 @@ EditorResult Editor::draw(Ui& ui, sim::EngineDesign& d, sim::Dyno& dyno,
                           bool dirty, float dt) {
     EditorResult r;
     if (m_statusTimer > 0.0f) m_statusTimer -= dt;
-    if (!m_savedListed) refreshSaved();
 
     const Palette& pal = ui.pal();
     const sim::DesignSummary sum = sim::summarise(d);
@@ -97,49 +74,39 @@ EditorResult Editor::draw(Ui& ui, sim::EngineDesign& d, sim::Dyno& dyno,
 
     // Starting a sweep joins any run already in flight, which would stall the
     // interface for as long as that sweep had left to go.
+    if (ui.button("PART LOAD", 866.0f, 22.0f, 84.0f, 28.0f, dyno.running()) &&
+        !dyno.running()) {
+        dyno.startMap(sim::paramsFromDesign(d));
+        dyno.setLabel(d.name);
+        status("Part-load map started");
+    }
     if (ui.button("DYNO PULL", 958.0f, 22.0f, 84.0f, 28.0f, dyno.running()) &&
         !dyno.running()) {
         dyno.start(sim::paramsFromDesign(d));
         dyno.setLabel(d.name);
         status("Dyno sweep started");
     }
-    if (ui.button("SAVE", 1050.0f, 22.0f, 74.0f, 28.0f)) {
-        const std::string path = "designs/" + sanitise(d.name) + ".eng";
-        std::error_code ec;
-        std::filesystem::create_directory("designs", ec);
-        if (sim::saveDesign(d, path)) { status("Saved " + path); refreshSaved(); }
-        else status("Could not write " + path);
+    if (ui.button("FILES", 1050.0f, 22.0f, 74.0f, 28.0f, m_files.visible())) {
+        if (m_files.visible()) m_files.close();
+        else m_files.open("designs", sanitise(d.name) + ".json");
     }
     if (ui.button("APPLY", 1132.0f, 22.0f, 96.0f, 28.0f, dirty)) r.apply = true;
     if (ui.button("REVERT", 1236.0f, 22.0f, 86.0f, 28.0f)) r.revert = true;
     if (ui.button("CLOSE", 1330.0f, 22.0f, 74.0f, 28.0f)) visible = false;
 
-    // ---- Preset and file row ----------------------------------------------
-    ui.column(38.0f, 66.0f, 400.0f);
-    ui.choice("PRESET", m_preset, presetNameList(), sim::presetCount());
-    if (ui.button("LOAD PRESET", 446.0f, 66.0f, 110.0f, 26.0f)) {
-        d = sim::preset(m_preset);
-        r.changed = true;
-        r.apply = true;
-        status(std::string("Loaded preset: ") + d.name);
-    }
-    ui.column(600.0f, 66.0f, 400.0f);
-    ui.choice("SAVED", m_savedPick, m_savedPtrs.data(),
-              static_cast<int>(m_savedPtrs.size()));
-    if (ui.button("OPEN", 1008.0f, 66.0f, 90.0f, 26.0f)) {
-        if (!m_saved.empty()) {
-            const std::string path = "designs/" +
-                m_saved[static_cast<std::size_t>(std::clamp(m_savedPick, 0,
-                    static_cast<int>(m_saved.size()) - 1))] + ".eng";
-            if (sim::loadDesign(d, path)) {
-                r.changed = true;
-                r.apply = true;
-                status("Opened " + path);
-            } else {
-                status("Could not read " + path);
-            }
-        }
-    }
+    // ---- Which engine is on the bench --------------------------------------
+    // The preset dropdown used to live here. It was a second way of opening the
+    // same files the browser opens, kept in a different order and needing its
+    // own list, so all that is left is the one thing it was really telling you:
+    // which engine this is.
+    ui.text("ENGINE", 38.0f, 66.0f, 12, pal.dim);
+    ui.text(d.name, 38.0f, 82.0f, 20, pal.text);
+    if (ui.button("PRESETS", 600.0f, 70.0f, 100.0f, 26.0f))
+        m_files.open("presets", sanitise(d.name) + ".json");
+    if (ui.button("DESIGNS", 708.0f, 70.0f, 100.0f, 26.0f))
+        m_files.open("designs", sanitise(d.name) + ".json");
+    ui.text(sim::presetsAreFiles() ? "presets/*.json" : "presets are compiled in",
+            818.0f, 76.0f, 12, pal.dim);
 
     // ---- Tab rail ----------------------------------------------------------
     float ty = kBodyY;
@@ -166,6 +133,26 @@ EditorResult Editor::draw(Ui& ui, sim::EngineDesign& d, sim::Dyno& dyno,
     ui.rect(kSide.position.x, kSide.position.y, kSide.size.x, kSide.size.y,
             pal.bg, pal.line, 1.0f);
     sidebar(ui, d, sum, dyno);
+
+    // ---- File browser ------------------------------------------------------
+    // Drawn last so it sits over everything, which is what makes it modal
+    // enough: the controls beneath it are still there but nobody can reach past
+    // the dimmed backdrop to hit them by accident.
+    if (m_files.visible()) {
+        const FileBrowser::Result fr = m_files.draw(ui, 360.0f, 120.0f, 700.0f, 520.0f);
+        if (fr.action == FileBrowser::Action::Open) {
+            if (sim::loadDesign(d, fr.path)) {
+                r.changed = true;
+                r.apply = true;
+                status("Opened " + fr.path);
+            } else {
+                status("Could not read " + fr.path);
+            }
+        } else if (fr.action == FileBrowser::Action::Save) {
+            if (sim::saveDesign(d, fr.path)) status("Saved " + fr.path);
+            else status("Could not write " + fr.path);
+        }
+    }
 
     // ---- Status ------------------------------------------------------------
     if (m_statusTimer > 0.0f) ui.text(m_status, 38.0f, 772.0f, 12, pal.good);
@@ -300,6 +287,8 @@ void Editor::body(Ui& ui, sim::EngineDesign& d, EditorResult& r,
     case 3: {   // ---------------------------------------------- FUEL & SPARK
         ui.column(kColA, top, kColW);
         ui.heading("FUEL");
+        touch(ui.choice("SYSTEM", d.fuelSystem, sim::fuelSystemNames(),
+                        static_cast<int>(sim::FuelSystem::Count)));
         touch(ui.choice("TYPE", d.fuel, sim::fuelNames(),
                         static_cast<int>(sim::FuelKind::Count)));
         ui.readout("STOICHIOMETRIC AFR", fmt("%.2f : 1", sum.stoichAfr));
@@ -339,8 +328,13 @@ void Editor::body(Ui& ui, sim::EngineDesign& d, EditorResult& r,
         endB = ui.cursorY();
         break;
     }
-    case 4: {   // ---------------------------------------------- OIL & FRICTION
+    case 4: {   // ------------------------------------ COOLING, OIL & FRICTION
         ui.column(kColA, top, kColW);
+        ui.heading("COOLING");
+        touch(ui.choice("SYSTEM", d.cooling, sim::coolingNames(),
+                        static_cast<int>(sim::Cooling::Count)));
+        ui.note("Air cooling runs the chamber walls far hotter,");
+        ui.note("which costs charge density and so power per litre.");
         ui.heading("OIL");
         touch(ui.choice("GRADE", d.oilGrade, sim::oilNames(),
                         static_cast<int>(sim::OilGrade::Count)));
@@ -370,8 +364,12 @@ void Editor::body(Ui& ui, sim::EngineDesign& d, EditorResult& r,
         touch(ui.slider("PLENUM VOLUME", d.plenumVolume, 0.15, 20.0, "%.2f litre", 0.05));
         touch(ui.slider("RUNNER LENGTH", d.runnerLength, 60.0, 900.0, "%.0f mm", 5.0));
         touch(ui.slider("RUNNER DIAMETER", d.runnerDia, 15.0, 90.0, "%.1f mm", 0.5));
-        ui.readout("RAM TUNED NEAR", fmt("%.0f rpm", sum.tunedRpmIntake), pal.accent);
-        ui.note("Long runners fill low down, short ones high up.");
+        ui.readout("WAVE RETURNS AFTER", fmt("%.2f ms", sum.intakeEchoMs) +
+                                         fmt(", %.0f deg at redline", sum.intakeEchoDeg),
+                   pal.accent);
+        ui.note("The runner helps when its echo comes back while");
+        ui.note("the inlet is still open, so compare that against");
+        ui.note("inlet duration. Long fills low down, short high up.");
         endA = ui.cursorY();
 
         ui.column(kColB, top, kColW);
@@ -404,7 +402,11 @@ void Editor::body(Ui& ui, sim::EngineDesign& d, EditorResult& r,
         touch(ui.slider("PRIMARY LENGTH", d.primaryLength, 80.0, 1200.0, "%.0f mm", 10.0));
         touch(ui.slider("PRIMARY DIAMETER", d.primaryDia, 15.0, 90.0, "%.1f mm", 0.5));
         touch(ui.slider("COLLECTOR VOLUME", d.collectorVol, 0.2, 25.0, "%.2f litre", 0.1));
-        ui.readout("SCAVENGE TUNED NEAR", fmt("%.0f rpm", sum.tunedRpmExhaust), pal.accent);
+        ui.readout("WAVE RETURNS AFTER", fmt("%.2f ms", sum.exhaustEchoMs) +
+                                         fmt(", %.0f deg at redline", sum.exhaustEchoDeg),
+                   pal.accent);
+        ui.note("The primary scavenges when its echo lands inside");
+        ui.note(fmt("overlap - which is %.0f deg here.", sum.overlap));
         endA = ui.cursorY();
 
         ui.column(kColB, top, kColW);
@@ -438,6 +440,8 @@ void Editor::body(Ui& ui, sim::EngineDesign& d, EditorResult& r,
         touch(ui.slider("MASS", d.vehicleMass, 120.0, 8000.0, "%.0f kg", 10.0));
         touch(ui.slider("DRAG AREA Cd x A", d.dragArea, 0.10, 3.00, "%.2f m2", 0.01));
         touch(ui.slider("WHEEL RADIUS", d.wheelRadius, 0.15, 0.75, "%.3f m", 0.005));
+        touch(ui.slider("TYRE GRIP", d.tyreGrip, 0.30, 2.20, "%.2f", 0.01));
+        touch(ui.slider("WEIGHT ON DRIVEN WHEELS", d.driveShare, 0.15, 1.00, "%.0f %%", 0.01));
         touch(ui.slider("CLUTCH CAPACITY", d.clutchCapacity, 40.0, 3000.0, "%.0f N m", 10.0));
         touch(ui.slider("BRAKE TORQUE", d.brakeTorque, 200.0, 12000.0, "%.0f N m", 50.0));
         ui.heading("AT THE LIMITER");
@@ -543,8 +547,64 @@ void Editor::firingChart(Ui& ui, const sim::DesignSummary& sum, float x, float y
 }
 
 // ---------------------------------------------------------------------------
+// The part-load map, drawn as what it is: an island of efficiency with the
+// engine's whole operating range around it. Cell shade is specific fuel
+// consumption, so the darker the cell the more it burns for what it returns.
+void Editor::mapChart(Ui& ui, sim::Dyno& dyno, float x, float y, float w, float h) {
+    const Palette& pal = ui.pal();
+    ui.rect(x, y, w, h, pal.panel, pal.line, 1.0f);
+
+    const int rows = dyno.mapLoadPoints(), cols = dyno.mapRpmPoints();
+    if (!dyno.hasMap() || rows < 2 || cols < 2) {
+        ui.centred(dyno.running() ? "mapping..." : "no map yet - press PART LOAD",
+                   x + w * 0.5f, y + h * 0.5f - 8.0f, 13, pal.dim);
+        return;
+    }
+
+    float best = 1e9f, worst = 0.0f;
+    for (int r = 0; r < rows; ++r)
+        for (int cI = 0; cI < cols; ++cI) {
+            const float b = dyno.mapCell(r, cI).bsfc;
+            if (b > 1.0f) { best = std::min(best, b); worst = std::max(worst, b); }
+        }
+    if (best > worst) { best = 200.0f; worst = 600.0f; }
+
+    const float x0 = x + 42.0f, x1 = x + w - 52.0f;
+    const float yb = y + h - 22.0f, yt = y + 16.0f;
+    const float cw = (x1 - x0) / cols, ch = (yb - yt) / rows;
+
+    for (int r = 0; r < rows; ++r) {
+        for (int cI = 0; cI < cols; ++cI) {
+            const sim::MapCell m = dyno.mapCell(r, cI);
+            const float cx = x0 + cw * cI;
+            const float cy = yb - ch * (r + 1);
+            sf::Color fill = pal.grid;
+            if (m.bsfc > 1.0f) {
+                // Best is brightest: the island stands out rather than the edges.
+                const float t = std::clamp((worst - m.bsfc) / std::max(1.0f, worst - best),
+                                           0.0f, 1.0f);
+                fill = sf::Color(static_cast<std::uint8_t>(40 + 200 * t * t),
+                                 static_cast<std::uint8_t>(40 + 150 * t),
+                                 static_cast<std::uint8_t>(60 + 40 * (1.0f - t)));
+            }
+            ui.rect(cx + 1.0f, cy + 1.0f, cw - 2.0f, ch - 2.0f, fill);
+            if (cw > 42.0f && ch > 18.0f && m.bsfc > 1.0f)
+                ui.centred(fmt("%.0f", m.bsfc), cx + cw * 0.5f, cy + ch * 0.5f - 6.0f,
+                           10, pal.text);
+        }
+        ui.right(fmt("%.0f%%", dyno.mapCell(r, 0).throttle * 100.0f), x0 - 4.0f,
+                 yb - ch * (r + 0.5f) - 6.0f, 10, pal.dim);
+    }
+    for (int cI = 0; cI < cols; cI += std::max(1, cols / 5))
+        ui.centred(fmt("%.0f", dyno.mapCell(0, cI).rpm), x0 + cw * (cI + 0.5f),
+                   yb + 3.0f, 10, pal.dim);
+    ui.text("g/kWh", x1 + 6.0f, yt, 10, pal.dim);
+    ui.text(fmt("best %.0f", best), x1 + 6.0f, yt + 14.0f, 10, pal.accent);
+}
+
 void Editor::dynoChart(Ui& ui, sim::Dyno& dyno, float x, float y, float w, float h) {
     const Palette& pal = ui.pal();
+    if (dyno.hasMap()) { mapChart(ui, dyno, x, y, w, h); return; }
     ui.rect(x, y, w, h, pal.panel, pal.line, 1.0f);
 
     const int n = dyno.count();
@@ -639,13 +699,15 @@ void Editor::sidebar(Ui& ui, const sim::EngineDesign& d, const sim::DesignSummar
     ui.readout("INDUCTION", d.charger == 0
                    ? std::string("naturally aspirated")
                    : std::string(sim::chargerNames()[d.charger]) + fmt(", %.2f bar", d.boost));
-    ui.readout("FUEL", sim::fuelNames()[d.fuel]);
+    ui.readout("FUEL", std::string(sim::fuelNames()[d.fuel]) + ", " +
+                       sim::fuelSystemNames()[d.fuelSystem]);
     ui.readout("OIL", std::string(sim::oilNames()[d.oilGrade]) +
                       fmt(", %.0f C", d.oilTempTarget));
     ui.readout("EXHAUST", std::string(sim::headerNames()[d.header]) + ", " +
                           sim::mufflerNames()[d.muffler]);
-    ui.readout("RAM / SCAVENGE TUNED", fmt("%.0f", sum.tunedRpmIntake) +
-                                       fmt(" / %.0f rpm", sum.tunedRpmExhaust));
+    ui.readout("COOLING", sim::coolingNames()[d.cooling]);
+    ui.readout("WAVE ECHO IN / EX", fmt("%.0f", sum.intakeEchoDeg) +
+                                    fmt(" / %.0f deg at redline", sum.exhaustEchoDeg));
     ui.readout("VALVE FLOAT", fmt("%.0f rpm", sum.valveFloatRpm),
                sum.valveFloatRpm < d.redline ? pal.alert : pal.good);
     ui.readout("REDLINE", fmt("%.0f rpm", d.redline));

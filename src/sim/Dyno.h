@@ -14,6 +14,16 @@ struct DynoPoint {
     float power  = 0.0f;   // kW
 };
 
+// One cell of the part-load map: what the engine does at a given speed and
+// throttle opening, and what it burns to do it.
+struct MapCell {
+    float rpm      = 0.0f;
+    float throttle = 0.0f;  // 0..1
+    float torque   = 0.0f;  // N m
+    float power    = 0.0f;  // kW
+    float bsfc     = 0.0f;  // g/kWh, 0 where the engine makes no useful power
+};
+
 // ---------------------------------------------------------------------------
 // A steady-state dynamometer, run on a worker thread against a private copy of
 // the engine so the one you are listening to keeps running.
@@ -36,6 +46,16 @@ public:
 
     // Sweeps from just above idle to the redline. Cancels any run in progress.
     void start(const EngineParams& params, int points = 26);
+
+    // Wide-open throttle is not where anything is driven. This sweeps speed
+    // against throttle opening and records specific fuel consumption in each
+    // cell, which is the map an engine is actually judged on: where it is
+    // efficient, and how big that island is.
+    void startMap(const EngineParams& params, int rpmPoints = 9, int loadPoints = 6);
+    bool  hasMap() const { return m_mapCount.load(std::memory_order_acquire) > 0; }
+    int   mapRpmPoints()  const { return m_mapRpmPoints; }
+    int   mapLoadPoints() const { return m_mapLoadPoints; }
+    MapCell mapCell(int loadIndex, int rpmIndex) const;
     void cancel();
 
     bool  running()  const { return m_running.load(std::memory_order_acquire); }
@@ -57,6 +77,7 @@ public:
 
 private:
     void run(EngineParams params, int points);
+    void runMap(EngineParams params, int rpmPoints, int loadPoints);
 
     std::thread m_worker;
     std::atomic<bool>  m_running{false};
@@ -67,6 +88,10 @@ private:
     std::atomic<float> m_peakTorqueNm{0.0f}, m_peakTorqueRpm{0.0f};
     // Written by the worker before m_count is published, read afterwards.
     DynoPoint m_points[kMaxPoints];
+    static constexpr int kMaxMapCells = 128;
+    std::atomic<int> m_mapCount{0};
+    int m_mapRpmPoints = 0, m_mapLoadPoints = 0;
+    MapCell m_map[kMaxMapCells];
     std::string m_label;
 };
 

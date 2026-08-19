@@ -1,6 +1,7 @@
 #pragma once
 #include "sim/Dyno.h"
 #include "sim/EngineDesign.h"
+#include "ui/FileBrowser.h"
 #include "ui/Widgets.h"
 
 #include <string>
@@ -31,7 +32,6 @@ public:
                       bool dirty, float dt);
 
     void status(const std::string& s, float seconds = 3.0f);
-    void refreshSaved();
 
 private:
     void tab(Ui& ui, int index, const char* name, float x, float& y);
@@ -42,15 +42,12 @@ private:
     void firingChart(Ui& ui, const sim::DesignSummary& sum, float x, float y,
                      float w, float h);
     void dynoChart(Ui& ui, sim::Dyno& dyno, float x, float y, float w, float h);
+    void mapChart(Ui& ui, sim::Dyno& dyno, float x, float y, float w, float h);
 
     int   m_tab = 0;
     float m_scroll[12]{};
     float m_contentH[12]{};
-    int   m_preset = 0;
-    int   m_savedPick = 0;
-    bool  m_savedListed = false;
-    std::vector<std::string> m_saved;      // file stems found in designs/
-    std::vector<const char*> m_savedPtrs;  // what the choice widget reads
+    FileBrowser m_files;
     std::string m_status;
     float m_statusTimer = 0.0f;
 };

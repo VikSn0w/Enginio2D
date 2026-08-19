@@ -27,10 +27,90 @@ DynoPoint Dyno::point(int i) const {
 
 void Dyno::start(const EngineParams& params, int points) {
     cancel();
+    m_mapCount.store(0, std::memory_order_release);
     m_count.store(0, std::memory_order_release);
     m_progress.store(0.0f, std::memory_order_relaxed);
     m_running.store(true, std::memory_order_release);
     m_worker = std::thread(&Dyno::run, this, params, std::clamp(points, 4, kMaxPoints));
+}
+
+MapCell Dyno::mapCell(int loadIndex, int rpmIndex) const {
+    const int i = loadIndex * m_mapRpmPoints + rpmIndex;
+    if (i < 0 || i >= m_mapCount.load(std::memory_order_acquire)) return {};
+    return m_map[i];
+}
+
+void Dyno::startMap(const EngineParams& params, int rpmPoints, int loadPoints) {
+    cancel();
+    m_mapCount.store(0, std::memory_order_release);
+    m_count.store(0, std::memory_order_release);
+    m_progress.store(0.0f, std::memory_order_relaxed);
+    m_stop.store(false, std::memory_order_release);
+    m_running.store(true, std::memory_order_release);
+    m_worker = std::thread(&Dyno::runMap, this, params, rpmPoints, loadPoints);
+}
+
+void Dyno::runMap(EngineParams params, int rpmPoints, int loadPoints) {
+    rpmPoints  = std::clamp(rpmPoints, 2, 16);
+    loadPoints = std::clamp(loadPoints, 2, 8);
+    m_mapRpmPoints  = rpmPoints;
+    m_mapLoadPoints = loadPoints;
+
+    Engine engine(params);
+    engine.warmUp();
+    engine.setIgnition(true);
+    engine.drivetrain().setGear(0);
+
+    const double lo = std::max(700.0, params.idleTargetRpm * 1.15);
+    const double hi = std::max(lo + 500.0, params.redline);
+    const int total = rpmPoints * loadPoints;
+
+    for (int li = 0; li < loadPoints; ++li) {
+        // Below about a sixth of throttle most engines are pumping against a
+        // closed plate and the numbers say more about the throttle than the
+        // engine, so the map starts above that.
+        const double throttle = 0.16 + (1.0 - 0.16) * li / std::max(1, loadPoints - 1);
+        for (int ri = 0; ri < rpmPoints; ++ri) {
+            if (m_stop.load(std::memory_order_acquire)) {
+                m_running.store(false, std::memory_order_release);
+                return;
+            }
+            const double rpm = lo + (hi - lo) * ri / std::max(1, rpmPoints - 1);
+            engine.setThrottle(throttle);
+            engine.setSpeedHold(true, rpm);
+
+            const double cycleTime = 120.0 / rpm;
+            const double settle  = std::max(0.25, 7.0 * cycleTime);
+            const double measure = std::max(0.16, 5.0 * cycleTime);
+            for (double t = 0.0; t < settle; t += kStepDt) engine.advance(kStepDt);
+
+            double sumT = 0.0, sumFuel = 0.0;
+            int n = 0;
+            for (double t = 0.0; t < measure; t += kStepDt) {
+                engine.advance(kStepDt);
+                sumT += engine.heldTorque();
+                sumFuel += engine.snapshot().fuelFlow;   // kg/h
+                ++n;
+            }
+            const float torque = static_cast<float>(n > 0 ? sumT / n : 0.0);
+            const float power  = static_cast<float>(torque * rpm * 2.0 * kPi / 60.0 * 0.001);
+            const float fuel   = static_cast<float>(n > 0 ? sumFuel / n : 0.0);
+            // Specific consumption is meaningless where the engine is not
+            // producing anything: at light load and low speed it is only just
+            // turning itself over.
+            const float bsfc = power > 0.5f ? fuel * 1000.0f / power : 0.0f;
+
+            const int i = li * rpmPoints + ri;
+            if (i < kMaxMapCells)
+                m_map[i] = {static_cast<float>(rpm), static_cast<float>(throttle),
+                            torque, power, bsfc};
+            m_progress.store(static_cast<float>(i + 1) / total, std::memory_order_relaxed);
+            m_mapCount.store(i + 1, std::memory_order_release);
+        }
+    }
+
+    m_progress.store(1.0f, std::memory_order_relaxed);
+    m_running.store(false, std::memory_order_release);
 }
 
 void Dyno::run(EngineParams params, int points) {

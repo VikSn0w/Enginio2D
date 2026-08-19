@@ -1,6 +1,8 @@
 #pragma once
 #include "sim/Drivetrain.h"
+#include "sim/PressureWave.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -151,6 +153,7 @@ struct EngineParams {
     double lambdaCruise   = 1.00;   // commanded lambda at light load
     double lambdaPower    = 0.87;   // ... and at full load
     FuelSpec fuel;
+    int    fuelSystem = 1;   // 0 carburettor, 1 port injection, 2 direct
     double combustionEff  = 0.94;
     double wallTemp       = 450.0;  // K
     // Single-zone models always under-predict wall heat loss (they see none of
@@ -203,7 +206,26 @@ struct EngineParams {
 
     // Exhaust
     RunnerSpec exhaustRunner{ 0.42, 0.00090, 1.5, 7.0e4 };
+    // How much of a pulse the far end of each runner sends back, and how much
+    // the pipe rounds it off on the way. Negative because a runner opens into
+    // something much larger at both ends, and an area expansion inverts a
+    // pulse: that inversion is why an exhaust primary scavenges rather than
+    // blows back.
+    double intakeReflect  = -0.70;
+    double exhaustReflect = -0.45;
+    double waveDamping    = 0.12;
+    // The plane-wave relation the line uses assumes the whole port area moves
+    // as one piston into a pipe that loses nothing. A real pulse disperses,
+    // rubs along the walls and spills at every area change, so it arrives back
+    // worth appreciably less than that. Without this the swing between a
+    // well and a badly chosen primary is about twice what a header really does.
+    double waveStrength   = 0.50;
     double collectorVolume = 0.0016; // m^3
+    // How many separate collectors the exhaust has. Banks that merge into one
+    // pipe share a collector and can interfere with each other; banks with
+    // their own systems cannot. Set from the header style, because that is
+    // what decides it on a real engine.
+    int    exhaustBanks    = 1;
     double outletArea      = 0.0022; // m^2, collector to the rest of the system
 
     // Acoustic properties of the exhaust system. These feed the pipe model in
@@ -253,6 +275,13 @@ struct Cylinder {
     double exRunnerBurned   = 0.0;
     double exRunnerPressure = Thermo::pAmb;
     double exRunnerTemp     = Thermo::tAmb;
+
+    // The travelling wave in each runner, which is what makes pipe length a
+    // matter of timing rather than just of volume.
+    PressureWave intakeWave;
+    PressureWave exhaustWave;
+    double intakeWavePa  = 0.0;   // perturbation at the valve right now
+    double exhaustWavePa = 0.0;
     // The primary pipe is a radiator, and its own temperature is what decides
     // how much it takes out of the gas going past.
     double exWallTemp       = Thermo::tAmb;
@@ -353,7 +382,7 @@ public:
     // Skip the warm-up. A dyno pull is done on a hot engine, never a cold one.
     void warmUp() {
         m_oilTemp = m_p.oilTempTarget;
-        m_collectorWall = 900.0;
+        for (std::size_t b = 0; b < m_bankCount; ++b) m_collectorWall[b] = 900.0;
         for (Cylinder& c : m_cyl) c.exWallTemp = 950.0;
     }
 
@@ -361,7 +390,16 @@ public:
 
     // Acoustic sources, in Pa relative to ambient: the exhaust collector and
     // the intake plenum. The pipe models downstream turn these into sound.
-    double collectorGauge() const { return m_collectorPressure - Thermo::pAmb; }
+    // Mean over the banks, for the level estimate in the synthesiser.
+    double collectorGauge() const {
+        double sum = 0.0;
+        for (std::size_t b = 0; b < m_bankCount; ++b) sum += m_collectorPressure[b];
+        return sum / static_cast<double>(m_bankCount) - Thermo::pAmb;
+    }
+    double collectorGauge(std::size_t bank) const {
+        return m_collectorPressure[std::min(bank, m_bankCount - 1)] - Thermo::pAmb;
+    }
+    std::size_t bankCount() const { return m_bankCount; }
     double intakeGauge()    const { return m_plenumPressure - Thermo::pAmb; }
 
     Drivetrain&       drivetrain()       { return m_drive; }
@@ -395,6 +433,8 @@ private:
     void   step(double dt);
     void   rebuild(bool preserveMotion);
     double cylinderVolume(double phaseDeg) const;
+    double volumeFromTrig(double sinTh, double cosTh) const;
+    double dVolumeFromTrig(double sinTh, double cosTh) const;
     double dVolumeDTheta(double phaseDeg) const;  // m^3 per radian
     double portArea(const ValveTiming& v, double lift) const;
     static double orificeFlow(double pUp, double tUp, double pDown, double area);
@@ -413,6 +453,7 @@ private:
     double m_crankAngle = 0.0;    // deg, 0..720
     double m_omega      = 0.0;    // rad/s
     double m_throttle   = 0.0;
+    double m_throttleLagged = 0.0;  // fuel film lag, for the carburettor model
     bool   m_starter    = false;
     bool   m_ignition   = true;
     bool   m_speedHold  = false;
@@ -434,12 +475,21 @@ private:
     double m_throttleFlow  = 0.0;    // kg/s, filtered
 
     // Exhaust collector: every runner dumps into it, it vents to atmosphere.
-    double m_collectorMass     = 0.0;
-    double m_collectorEnergy   = 0.0;
-    double m_collectorBurned   = 0.0;
-    double m_collectorTemp     = Thermo::tAmb;
-    double m_collectorPressure = Thermo::pAmb;
-    double m_collectorWall     = Thermo::tAmb;
+    // One collector per bank. A V8's two banks do not share a pipe until well
+    // downstream, so a pulse from one bank cannot scavenge - or spoil - a port
+    // on the other. Running a single collector made a crossplane and a
+    // flat-plane V8 breathe identically and differ only in the sound they made,
+    // which is exactly backwards: the firing pattern within a bank is what
+    // header tuning has to work with.
+    static constexpr std::size_t kMaxBanks = 4;
+    std::array<double, kMaxBanks> m_collectorMass{};
+    std::array<double, kMaxBanks> m_collectorEnergy{};
+    std::array<double, kMaxBanks> m_collectorBurned{};
+    std::array<double, kMaxBanks> m_collectorTemp{};
+    std::array<double, kMaxBanks> m_collectorPressure{};
+    std::array<double, kMaxBanks> m_collectorWall{};
+    std::size_t m_bankCount = 1;
+    double m_collectorVolEach = 1.0e-3;
     double m_exRunnerWallArea  = 0.0;   // m^2, one primary
     double m_collectorWallArea = 0.0;
 
@@ -462,6 +512,7 @@ private:
     double m_sparkAdvance = 20.0;  // deg BTDC, current map output
     double m_afr          = 14.0;
     double m_lambda       = 1.0;
+    double m_knockFuelTerm = 1.0;  // octane part of the induction time, hoisted
     double m_knockLevel   = 0.0;   // smoothed knock intensity, 0..1
     double m_knockRetard  = 0.0;   // deg the ECU is holding back
     double m_camAdvance   = 0.0;   // deg, current phaser position

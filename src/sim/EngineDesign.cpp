@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <iomanip>
 #include <sstream>
 
@@ -20,6 +22,8 @@ const char* kPortN[]       = {"As cast", "Hand ported", "CNC ported"};
 const char* kFuelN[]       = {"Petrol 91 RON", "Petrol 95 RON", "Petrol 98 RON",
                               "Race fuel 110", "E85", "Ethanol E100", "Methanol",
                               "LPG", "CNG", "Diesel", "Nitromethane", "Hydrogen"};
+const char* kFuelSysN[]    = {"Carburettor", "Port injection", "Direct injection"};
+const char* kCoolingN[]    = {"Liquid", "Air", "Oil cooled"};
 const char* kOilN[]        = {"0W-20", "5W-30", "10W-40", "15W-50", "20W-60",
                               "10W-60 race"};
 const char* kChargerN[]    = {"Naturally aspirated", "Turbocharger",
@@ -81,6 +85,14 @@ int banksFor(int layout, int cylinders) {
         case Layout::W:    return cylinders >= 8 ? 4 : 2;
         default:           return 1;
     }
+}
+
+// The header style stretches or shortens the primary the design asks for; both
+// the solver and the summary have to agree about that or the number reported
+// is not the number simulated.
+double kHeaderLenFor(int header) {
+    static const double kHeaderLen[] = {0.45, 1.00, 1.15, 1.00, 1.00};
+    return kHeaderLen[idx(header, static_cast<int>(HeaderStyle::Count))];
 }
 
 double liftCapFor(int valvetrain) {
@@ -216,6 +228,8 @@ const char* const* valveMetalNames() { return kMetalN; }
 const char* const* camNames()        { return kCamN; }
 const char* const* portNames()       { return kPortN; }
 const char* const* fuelNames()       { return kFuelN; }
+const char* const* coolingNames() { return kCoolingN; }
+const char* const* fuelSystemNames() { return kFuelSysN; }
 const char* const* oilNames()        { return kOilN; }
 const char* const* chargerNames()    { return kChargerN; }
 const char* const* headerNames()     { return kHeaderN; }
@@ -296,6 +310,8 @@ void clampDesign(EngineDesign& d) {
     d.idleRpm = std::clamp(d.idleRpm, std::min(idleFloor, d.redline * 0.35),
                            std::min(3000.0, d.redline * 0.6));
 
+    d.fuelSystem    = idx(d.fuelSystem, static_cast<int>(FuelSystem::Count));
+    d.cooling       = idx(d.cooling, static_cast<int>(Cooling::Count));
     d.oilGrade      = idx(d.oilGrade, static_cast<int>(OilGrade::Count));
     d.oilTempTarget = std::clamp(d.oilTempTarget, 60.0, 150.0);
     d.oilStartTemp  = std::clamp(d.oilStartTemp, -30.0, d.oilTempTarget);
@@ -326,6 +342,8 @@ void clampDesign(EngineDesign& d) {
     d.wheelRadius    = std::clamp(d.wheelRadius, 0.15, 0.75);
     d.vehicleMass    = std::clamp(d.vehicleMass, 120.0, 8000.0);
     d.dragArea       = std::clamp(d.dragArea, 0.10, 3.00);
+    d.tyreGrip       = std::clamp(d.tyreGrip, 0.30, 2.20);
+    d.driveShare     = std::clamp(d.driveShare, 0.15, 1.00);
     d.clutchCapacity = std::clamp(d.clutchCapacity, 40.0, 3000.0);
     d.brakeTorque    = std::clamp(d.brakeTorque, 200.0, 12000.0);
 
@@ -398,6 +416,10 @@ EngineParams paramsFromDesign(const EngineDesign& din) {
     p.lambdaCruise   = d.lambdaCruise;
     p.lambdaPower    = d.lambdaPower;
     p.fuel           = kFuelSpec[idx(d.fuel, static_cast<int>(FuelKind::Count))];
+    p.fuelSystem     = idx(d.fuelSystem, static_cast<int>(FuelSystem::Count));
+    // Direct injection puts the whole charge in the bore, so all of the latent
+    // heat cools the trapped charge instead of the port air.
+    if (p.fuelSystem == static_cast<int>(FuelSystem::DirectInjection)) p.fuel.portEvap = 0.0;
     p.combustionEff  = d.combustionEff;
     p.knockControl   = d.knockControl;
     p.knockScale     = 2.2;
@@ -413,6 +435,13 @@ EngineParams paramsFromDesign(const EngineDesign& din) {
     p.cfC = 0.020 * d.frictionScale;
     p.cfD = 0.0016 * d.frictionScale;
     p.accessoryTorque = d.accessoryLoad;
+    // Wall temperature and how hard the charge is worked by it. Air cooling
+    // buys simplicity and pays for it here.
+    static const double kWallK[]  = {450.0, 495.0, 470.0};
+    static const double kWallHt[] = {1.50, 1.36, 1.44};
+    const int cool = idx(d.cooling, static_cast<int>(Cooling::Count));
+    p.wallTemp          = kWallK[cool];
+    p.heatTransferScale = kWallHt[cool];
     p.oil = kOilSpec[idx(d.oilGrade, static_cast<int>(OilGrade::Count))];
     p.oilTempTarget = d.oilTempTarget + 273.15;
     p.oilStartTemp  = d.oilStartTemp + 273.15;
@@ -460,16 +489,21 @@ EngineParams paramsFromDesign(const EngineDesign& din) {
                       ? std::clamp(0.62 - 0.06 * d.boost, 0.32, 0.80) : 1.0;
 
     // ---- Exhaust -----------------------------------------------------------
-    static const double kHeaderLen[]  = {0.45, 1.00, 1.15, 1.00, 1.00};
     static const double kHeaderZeta[] = {2.80, 1.50, 1.70, 1.40, 0.90};
     static const double kHeaderVol[]  = {0.60, 1.00, 1.40, 0.80, 0.25};
     static const double kMufflerA[]   = {0.0030, 0.0019, 0.0024, 0.0013};
     const int hd = idx(d.header, static_cast<int>(HeaderStyle::Count));
-    p.exhaustRunner.length = d.primaryLength * 1e-3 * kHeaderLen[hd];
+    p.exhaustRunner.length = d.primaryLength * 1e-3 * kHeaderLenFor(d.header);
     p.exhaustRunner.area   = kPi * 0.25 * (d.primaryDia * 1e-3) * (d.primaryDia * 1e-3);
     p.exhaustRunner.zeta   = kHeaderZeta[hd];
     p.exhaustRunner.viscous = 7.0e4 * (0.00090 / p.exhaustRunner.area);
     p.collectorVolume = d.collectorVol * 1e-3 * kHeaderVol[hd];
+    // Only a system that keeps the banks apart all the way to the tailpipe can
+    // stop one bank's pulses reaching the other's ports. A four-into-one or a
+    // tri-Y merges them, and then the whole engine shares one collector.
+    const bool separateBanks = hd == static_cast<int>(HeaderStyle::PerBank) ||
+                               hd == static_cast<int>(HeaderStyle::Open);
+    p.exhaustBanks = separateBanks ? banksFor(d.layout, d.cylinders) : 1;
     p.outletArea = kMufflerA[idx(d.muffler, static_cast<int>(MufflerKind::Count))] *
                    std::sqrt(std::max(dispRatio, 0.05)) *
                    (hd == static_cast<int>(HeaderStyle::Open) ? 1.6 : 1.0);
@@ -505,6 +539,8 @@ DrivetrainParams drivetrainFromDesign(const EngineDesign& din) {
     t.mass           = d.vehicleMass;
     t.dragArea       = d.dragArea;
     t.clutchCapacity = d.clutchCapacity;
+    t.tyreGrip       = d.tyreGrip;
+    t.driveShare     = d.driveShare;
     t.brakeTorque    = d.brakeTorque;
     t.lockRpm        = std::clamp(d.idleRpm * 1.55, 700.0, 4000.0);
     t.slipRpm        = std::clamp(d.idleRpm * 0.65, 250.0, 2000.0);
@@ -541,13 +577,16 @@ DesignSummary summarise(const EngineDesign& din) {
     const double area = kPi * 0.25 * (d.runnerDia * 1e-3) * (d.runnerDia * 1e-3);
     const double clearance = swept / (d.compression - 1.0);
     const double vEff = 0.5 * swept + clearance;
-    const double fHelm = (343.0 / (2.0 * kPi)) *
-                         std::sqrt(area / std::max(d.runnerLength * 1e-3 * vEff, 1e-9));
-    s.tunedRpmIntake = 26.0 * fHelm;
-    // Exhaust: the returning suction wave should arrive during overlap. This is
-    // the header-length rule of thumb, rearranged for speed.
-    const double ed = 180.0 + s.evo;
-    s.tunedRpmExhaust = ed * 850.0 / std::max(d.primaryLength / 25.4 + 3.0, 1.0);
+    // Runner waves. The intake carries cold air; the exhaust primary carries
+    // gas at around 900 K, where sound travels the better part of twice as
+    // fast, which is why an exhaust primary can be so much longer than an
+    // intake runner and still return in time to be useful.
+    constexpr double kColdC = 343.0;
+    const double kHotC = std::sqrt(1.33 * 287.0 * 900.0);
+    s.intakeEchoMs  = 2.0 * (d.runnerLength * 1e-3) / kColdC * 1000.0;
+    s.exhaustEchoMs = 2.0 * (d.primaryLength * 1e-3 * kHeaderLenFor(d.header)) / kHotC * 1000.0;
+    s.intakeEchoDeg  = 6.0 * d.redline * s.intakeEchoMs * 1e-3;
+    s.exhaustEchoDeg = 6.0 * d.redline * s.exhaustEchoMs * 1e-3;
 
     s.firingInterval = 720.0 / d.cylinders;
     s.valveFloatRpm  = floatRpmFor(d, boreM * d.intakeValveFrac);
@@ -798,6 +837,7 @@ EngineDesign makeSuperbike() {
     // car does not, so the overall ratio folds that in with the chain: about
     // 2.07 by 2.9. Leaving it out gears a 600 for 550 km/h.
     d.finalDrive = 6.05; d.wheelRadius = 0.30; d.vehicleMass = 250.0;
+    d.tyreGrip = 1.15; d.driveShare = 0.85;   // a bike squats onto its rear tyre
     d.dragArea = 0.35; d.clutchCapacity = 140.0; d.brakeTorque = 900.0;
     d.accentHue = 105.0; d.coverHue = 100.0; d.coverSat = 50.0;
     return d;
@@ -818,20 +858,111 @@ EngineDesign makeVTwin() {
     d.camProfile = static_cast<int>(CamGrind::Street);
     d.intakeDuration = 218.0; d.exhaustDuration = 226.0;
     d.fuel = static_cast<int>(FuelKind::Petrol91);
+    d.fuelSystem = static_cast<int>(FuelSystem::Carburettor);
     d.redline = 5800.0; d.idleRpm = 900.0;
     d.throttleBore = 46.0; d.plenumVolume = 0.8;
     d.runnerLength = 200.0; d.runnerDia = 40.0;
     d.primaryLength = 700.0; d.primaryDia = 42.0; d.collectorVol = 0.8;
     d.header = static_cast<int>(HeaderStyle::Open);
     d.muffler = static_cast<int>(MufflerKind::Chambered);
+    d.cooling = static_cast<int>(Cooling::Air);
     d.oilGrade = static_cast<int>(OilGrade::W20_60);
     d.accessoryLoad = 3.0;
     d.gearCount = 5;
     d.gears = {3.20, 2.10, 1.55, 1.24, 1.00, 0.90, 0.82, 0.76};
     // Primary reduction and belt drive together, as above.
     d.finalDrive = 3.90; d.wheelRadius = 0.33; d.vehicleMass = 340.0;
+    d.tyreGrip = 1.15; d.driveShare = 0.85;   // a bike squats onto its rear tyre
     d.dragArea = 0.60; d.clutchCapacity = 260.0; d.brakeTorque = 1100.0;
     d.accentHue = 32.0; d.coverHue = 30.0; d.coverSat = 25.0; d.blockShade = 22.0;
+    return d;
+}
+
+EngineDesign makeDucati900() {
+    EngineDesign d;
+    // The 904 cc air-cooled "desmodue" of the 1993 Monster: 90 degree L-twin,
+    // belt-driven single cam per head, two desmodromic valves per cylinder,
+    // two 38 mm constant-vacuum carburettors, dry clutch, six speeds. Factory
+    // claim is 80 PS at 7000 and 76 N m at 6000.
+    d.name = "Ducati Monster 900 (1993)";
+    d.layout = static_cast<int>(Layout::Vee);
+    d.cylinders = 2; d.bankAngle = 90.0;
+    // Both rods share one crankpin, so the cylinders fire 270 and 450 degrees
+    // apart rather than evenly. That gallop is the whole character of the
+    // engine, and it falls straight out of the layout.
+    d.crankType = static_cast<int>(CrankType::OddFire);
+
+    d.bore = 92.0; d.stroke = 68.0; d.rodRatio = 1.91;   // 130 mm rod
+    d.compression = 9.2; d.recipMass = 0.42; d.flywheel = 0.085;
+
+    // Desmodromic: a second lobe pulls each valve shut, so there are no springs
+    // to float and the profile can be far more aggressive than its speed range
+    // suggests. Two valves in a 92 mm bore leaves room for very large heads.
+    d.valvetrain = static_cast<int>(Valvetrain::Desmo);
+    d.intakeValves = 1; d.exhaustValves = 1;
+    d.intakeValveFrac = 0.467;    // 43 mm
+    d.exhaustValveFrac = 0.413;   // 38 mm
+    d.liftRatio = 0.275;          // 11.76 mm inlet, 10.56 mm exhaust
+    d.camProfile = static_cast<int>(CamGrind::Sport);
+    d.portWork = static_cast<int>(PortWork::AsCast);
+    // Workshop manual timing. The book gives two columns, measured with 0.20 mm
+    // and with 1 mm of valve clearance: inlet 43 BTDC / 85 ABDC and exhaust
+    // 82 BBDC / 46 ATDC at 0.20 mm, and 20/60 and 58/20 at 1 mm. Both describe
+    // the same cam and both give a 109.5 degree lobe separation - they differ
+    // only in how far off the seat you agree to call it open, which is why the
+    // centrelines below are the manual's exactly and the durations are not.
+    //
+    // Those two columns bracket the duration: 260 degrees at 1 mm, 308 at
+    // 0.20 mm. A desmo profile spends a long time barely off its seat flowing
+    // almost nothing, while the smooth hump this model uses carries real area
+    // everywhere it is open - so feeding it seat-to-seat numbers over-breathes
+    // the overlap, and feeding it the 1 mm numbers under-breathes the top end.
+    // The effective duration sits between the two. 285 is the value in that
+    // bracket that puts peak power at 7000 rpm, where the manual says it is.
+    d.intakeDuration = 285.0; d.intakeCentre = 110.5;
+    d.exhaustDuration = 283.0; d.exhaustCentre = 108.5;
+
+    // Carburettors: rich everywhere, richer at full throttle, and no sensor to
+    // pull it back. A big two-valve chamber with one plug burns slowly, and
+    // wants the ignition advance to match.
+    d.fuel = static_cast<int>(FuelKind::Petrol95);
+    d.fuelSystem = static_cast<int>(FuelSystem::Carburettor);
+    d.lambdaCruise = 0.95; d.lambdaPower = 0.85;
+    d.sparkIdle = 10.0; d.sparkPeak = 34.0; d.sparkPartLoad = 10.0;
+    d.burnDuration = 52.0; d.ignitionDelay = 9.0;
+    d.knockControl = false;       // no knock sensor on a 1993 carburetted twin
+    d.combustionEff = 0.93;
+    d.redline = 8000.0; d.idleRpm = 1150.0;
+
+    // Air-cooled, so it runs hot on thick oil. Two big pistons and a dry clutch
+    // have less to rub than four small ones, and almost nothing hangs off the
+    // front of the crank.
+    d.cooling = static_cast<int>(Cooling::Air);
+    d.oilGrade = static_cast<int>(OilGrade::W20_60);
+    d.oilTempTarget = 110.0;
+    d.frictionScale = 0.80; d.accessoryLoad = 2.5;
+
+    // Two 38 mm carburettors have the area of one 53.7 mm throttle. There is no
+    // plenum to speak of, just short rubber manifolds, which is why the
+    // throttle response is so immediate.
+    d.throttleBore = 53.7; d.plenumVolume = 1.0;
+    d.runnerLength = 130.0; d.runnerDia = 41.0;
+
+    d.primaryLength = 620.0; d.primaryDia = 44.0; d.collectorVol = 4.0;
+    d.header = static_cast<int>(HeaderStyle::TriY);
+    d.muffler = static_cast<int>(MufflerKind::Straight);
+
+    d.gearCount = 6;
+    d.gears = {2.466, 1.765, 1.350, 1.091, 0.958, 0.857, 0.80, 0.75};
+    // As with any bike, the primary reduction lives between the crank and the
+    // gearbox, so it folds in with the chain here: 2.0 by 15/38.
+    d.finalDrive = 5.07; d.wheelRadius = 0.318;
+    d.tyreGrip = 1.15; d.driveShare = 0.85;   // a bike squats onto its rear tyre
+    d.vehicleMass = 285.0;        // 185 kg dry, plus fluids and a rider
+    d.dragArea = 0.55;            // naked bike and an upright rider
+    d.clutchCapacity = 120.0; d.brakeTorque = 950.0;
+
+    d.accentHue = 4.0; d.coverHue = 8.0; d.coverSat = 55.0; d.blockShade = 30.0;
     return d;
 }
 
@@ -853,27 +984,77 @@ const Maker kMakers[] = {
     nullptr,            // index 0 is the default-constructed design
     makeTurboFour, makeCrossplaneV8, makeFlatplaneV8, makeInlineSix,
     makeBoxer, makeV12, makeBlownMethanol, makeDiesel, makeSuperbike,
-    makeVTwin, makeHydrogen,
+    makeVTwin, makeDucati900, makeHydrogen,
 };
 
 } // namespace
 
-int presetCount() { return static_cast<int>(sizeof(kMakers) / sizeof(kMakers[0])); }
+// ---------------------------------------------------------------------------
+// Presets live in presets/*.json, so they are data rather than code: they can
+// be read, edited, added to and shared without rebuilding anything. The
+// compiled-in table is the fallback for when that directory is missing - a
+// build that cannot find its presets should still start.
+//
+// Files are taken in filename order, which is why they are numbered: the order
+// they appear in the picker is a decision, not an accident of the alphabet.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct PresetLibrary {
+    std::vector<EngineDesign> designs;
+    bool fromFiles = false;
+
+    PresetLibrary() {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        for (const char* dir : {"presets", "../presets"}) {
+            if (!fs::is_directory(dir, ec)) continue;
+            std::vector<fs::path> files;
+            for (const auto& e : fs::directory_iterator(dir, ec))
+                if (e.is_regular_file(ec) && e.path().extension() == ".json")
+                    files.push_back(e.path());
+            std::sort(files.begin(), files.end());
+            for (const fs::path& f : files) {
+                EngineDesign d;
+                if (loadDesignJson(d, f.string())) designs.push_back(d);
+            }
+            if (!designs.empty()) { fromFiles = true; return; }
+        }
+        // Nothing on disk: fall back to the table compiled in.
+        for (std::size_t i = 0; i < sizeof(kMakers) / sizeof(kMakers[0]); ++i) {
+            EngineDesign d;
+            if (kMakers[i]) d = kMakers[i]();
+            clampDesign(d);
+            designs.push_back(d);
+        }
+    }
+};
+
+const PresetLibrary& library() {
+    static const PresetLibrary lib;
+    return lib;
+}
+
+} // namespace
+
+int presetCount() { return static_cast<int>(library().designs.size()); }
+
+bool presetsAreFiles() { return library().fromFiles; }
 
 EngineDesign preset(int i) {
-    EngineDesign d;
-    if (i > 0 && i < presetCount() && kMakers[i]) d = kMakers[i]();
+    const PresetLibrary& lib = library();
+    if (i < 0 || i >= static_cast<int>(lib.designs.size())) return EngineDesign{};
+    EngineDesign d = lib.designs[static_cast<std::size_t>(i)];
     clampDesign(d);
     return d;
 }
 
 const char* presetName(int i) {
-    static std::string cache[16];
-    const int n = presetCount();
-    if (i < 0 || i >= n) return "";
-    if (cache[i].empty()) cache[i] = preset(i).name;
-    return cache[i].c_str();
+    const PresetLibrary& lib = library();
+    if (i < 0 || i >= static_cast<int>(lib.designs.size())) return "";
+    return lib.designs[static_cast<std::size_t>(i)].name.c_str();
 }
+
 
 // ---------------------------------------------------------------------------
 // Save and load. One field per line, so a saved engine can be read, diffed and
@@ -893,12 +1074,13 @@ namespace {
     X(fuel) X(lambdaCruise) X(lambdaPower) X(sparkIdle) X(sparkPeak)           \
     X(sparkPartLoad) X(burnDuration) X(ignitionDelay) X(knockControl)          \
     X(combustionEff) X(redline) X(idleRpm)                                     \
-    X(oilGrade) X(oilTempTarget) X(oilStartTemp) X(frictionScale)              \
+    X(fuelSystem) X(cooling) X(oilGrade) X(oilTempTarget) X(oilStartTemp) X(frictionScale)              \
     X(accessoryLoad)                                                           \
     X(throttleBore) X(plenumVolume) X(runnerLength) X(runnerDia)               \
     X(charger) X(boost) X(spoolRpm) X(turboLag) X(intercooler)                 \
     X(primaryLength) X(primaryDia) X(collectorVol) X(header) X(muffler)        \
     X(gearCount) X(finalDrive) X(wheelRadius) X(vehicleMass) X(dragArea)       \
+    X(tyreGrip) X(driveShare)                                                  \
     X(clutchCapacity) X(brakeTorque)                                           \
     X(theme) X(accentHue) X(coverHue) X(coverSat) X(blockShade)                \
     X(showCutaway) X(showTopView)
@@ -908,6 +1090,111 @@ void assign(double& dst, const std::string& v) { dst = std::atof(v.c_str()); }
 void assign(bool& dst, const std::string& v)   { dst = v == "1" || v == "true"; }
 
 } // namespace
+
+namespace {
+
+// Minimal JSON, hand written because the schema is flat and adding a library
+// to emit sixty numbers would be the larger cost. Everything is a number, a
+// bool, one string and one array, which is a small enough grammar to read back
+// with a scanner rather than a parser.
+void jsonKey(std::ofstream& out, const char* key) {
+    out << "  \"" << key << "\": ";
+}
+
+std::string jsonEscape(const std::string& s) {
+    std::string out;
+    for (char ch : s) {
+        if (ch == '"' || ch == '\\') { out += '\\'; out += ch; }
+        else if (ch == '\n') out += "\\n";
+        else out += ch;
+    }
+    return out;
+}
+
+// Pull the raw text of a value out of a JSON object: everything after "key":
+// up to the comma that ends it, brackets respected.
+bool jsonValue(const std::string& src, const std::string& key, std::string& out) {
+    const std::string needle = "\"" + key + "\"";
+    std::size_t at = 0;
+    for (;;) {
+        at = src.find(needle, at);
+        if (at == std::string::npos) return false;
+        const std::size_t colon = src.find_first_not_of(" \t\r\n", at + needle.size());
+        if (colon == std::string::npos) return false;
+        if (src[colon] != ':') { at += needle.size(); continue; }
+        const std::size_t v = src.find_first_not_of(" \t\r\n", colon + 1);
+        if (v == std::string::npos) return false;
+        int depth = 0;
+        bool inStr = src[v] == '"';
+        std::size_t end = v;
+        for (; end < src.size(); ++end) {
+            const char ch = src[end];
+            if (inStr) {
+                if (ch == '\\') { ++end; continue; }
+                if (ch == '"' && end > v) { ++end; break; }
+            } else if (ch == '[' || ch == '{') ++depth;
+            else if (ch == ']' || ch == '}') {
+                if (depth == 0) break;
+                --depth;
+            } else if (ch == ',' && depth == 0) break;
+        }
+        out = src.substr(v, end - v);
+        while (!out.empty() && (out.back() == ' ' || out.back() == '\n' ||
+                                out.back() == '\r' || out.back() == '\t')) out.pop_back();
+        if (out.size() >= 2 && out.front() == '"' && out.back() == '"')
+            out = out.substr(1, out.size() - 2);
+        return true;
+    }
+}
+
+} // namespace
+
+bool saveDesignJson(const EngineDesign& d, const std::string& path) {
+    std::ofstream out(path);
+    if (!out) return false;
+    out << std::setprecision(10);
+    out << "{\n";
+    jsonKey(out, "format");   out << "\"enginio2d-design\",\n";
+    jsonKey(out, "version");  out << "1,\n";
+    jsonKey(out, "name");     out << '"' << jsonEscape(d.name) << "\",\n";
+#define X(f) jsonKey(out, #f); out << d.f << ",\n";
+    DESIGN_FIELDS(X)
+#undef X
+    jsonKey(out, "gears");
+    out << "[";
+    for (int i = 0; i < 8; ++i)
+        out << (i ? ", " : "") << d.gears[static_cast<std::size_t>(i)];
+    out << "]\n}\n";
+    return static_cast<bool>(out);
+}
+
+bool loadDesignJson(EngineDesign& d, const std::string& path) {
+    std::ifstream in(path);
+    if (!in) return false;
+    const std::string src((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+    if (src.find("enginio2d-design") == std::string::npos) return false;
+
+    EngineDesign fresh;
+    std::string v;
+    if (jsonValue(src, "name", v)) fresh.name = v;
+#define X(f) if (jsonValue(src, #f, v)) assign(fresh.f, v);
+    DESIGN_FIELDS(X)
+#undef X
+    if (jsonValue(src, "gears", v)) {
+        int i = 0;
+        std::size_t at = v.find('[');
+        while (at != std::string::npos && i < 8) {
+            at = v.find_first_of("-0123456789.", at + 1);
+            if (at == std::string::npos) break;
+            fresh.gears[static_cast<std::size_t>(i++)] = std::atof(v.c_str() + at);
+            at = v.find_first_not_of("-0123456789.eE", at);
+        }
+    }
+    clampDesign(fresh);
+    d = fresh;
+    return true;
+}
 
 bool saveDesign(const EngineDesign& d, const std::string& path) {
     std::ofstream out(path);
@@ -924,6 +1211,10 @@ bool saveDesign(const EngineDesign& d, const std::string& path) {
 }
 
 bool loadDesign(EngineDesign& d, const std::string& path) {
+    // JSON is what the program writes now; the older key-per-line files are
+    // still read so nothing saved before this stops opening.
+    if (path.size() > 5 && path.compare(path.size() - 5, 5, ".json") == 0)
+        return loadDesignJson(d, path);
     std::ifstream in(path);
     if (!in) return false;
     EngineDesign fresh;

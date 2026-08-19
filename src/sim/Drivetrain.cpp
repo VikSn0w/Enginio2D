@@ -55,9 +55,20 @@ double Drivetrain::step(double dt, double engineOmega) {
         m_wheelTorque = t * r;
     }
 
-    // Vehicle: driving force at the contact patch against aerodynamic drag,
-    // rolling resistance and the brakes.
-    const double driveForce = m_wheelTorque / m_p.wheelRadius;
+    // Traction limit. The contact patch can only pass what the weight over it
+    // and the friction coefficient allow; ask for more and the tyre spins,
+    // which costs the surplus rather than accelerating anything. Nothing here
+    // models the spinning wheel itself - the surplus is simply lost - but the
+    // limit is what stops first gear behaving like a spreadsheet.
+    const double gripForce = m_p.tyreGrip * m_p.driveShare * m_p.mass * kGravity;
+    double driveForce = m_wheelTorque / m_p.wheelRadius;
+    if (std::abs(driveForce) > gripForce && gripForce > 0.0) {
+        m_wheelSlip = std::clamp(std::abs(driveForce) / gripForce - 1.0, 0.0, 1.0);
+        driveForce = std::copysign(gripForce, driveForce);
+        m_wheelTorque = driveForce * m_p.wheelRadius;
+    } else {
+        m_wheelSlip = 0.0;
+    }
     const double drag = 0.5 * kAirDensity * m_p.dragArea * m_speed * m_speed;
     const double rolling = m_speed > 0.05 ? m_p.rollingCoef * m_p.mass * kGravity : 0.0;
     const double braking = m_speed > 0.05 ? m_brake * m_p.brakeTorque / m_p.wheelRadius : 0.0;
