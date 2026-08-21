@@ -152,12 +152,19 @@ public:
 
     void setThrottle(float t) { m_throttle.store(t, std::memory_order_relaxed); }
     void setBrake(float b)    { m_brakeCmd.store(b, std::memory_order_relaxed); }
+    // 0 is the pedal up and the clutch clamped, 1 is on the floor.
+    void setClutch(float c)   { m_clutchCmd.store(c, std::memory_order_relaxed); }
     void setStarter(bool s)   { m_starterCmd.store(s, std::memory_order_relaxed); }
     void setIgnition(bool i)  { m_ignitionCmd.store(i, std::memory_order_relaxed); }
     void setVolume01(float v) { m_gain.store(v, std::memory_order_relaxed); }
     // Gear changes are queued here and applied on the audio thread, which owns
     // the simulation.
     void requestGear(int g)   { m_gearRequest.store(g, std::memory_order_relaxed); }
+    // Shifting up and down is relative, so it has to be resolved against the
+    // gear the simulation is actually in rather than against the one the last
+    // snapshot showed - which is up to a chunk out of date, and is the wrong
+    // answer entirely when the gearbox has just refused a change.
+    void requestShift(int delta) { m_shiftDelta.fetch_add(delta, std::memory_order_relaxed); }
 
     // Hand a new specification to the audio thread, which owns the engine and
     // is the only thread allowed to rebuild it. Returns false if a previous
@@ -185,10 +192,12 @@ private:
 
     std::atomic<float> m_throttle{0.0f};
     std::atomic<float> m_brakeCmd{0.0f};
+    std::atomic<float> m_clutchCmd{0.0f};
     std::atomic<float> m_gain{0.7f};
     std::atomic<bool>  m_starterCmd{false};
     std::atomic<bool>  m_ignitionCmd{true};
     std::atomic<int>   m_gearRequest{-1};
+    std::atomic<int>   m_shiftDelta{0};
 
     // Configuration hand-off: written by the UI thread, read by the audio
     // thread, with a generation counter to publish and an acknowledgement to

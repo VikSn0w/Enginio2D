@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "audio/EngineSound.h"
+#include "input/Gamepad.h"
 #include "sim/Dyno.h"
 #include "sim/Engine.h"
 #include "sim/EngineDesign.h"
@@ -668,14 +669,27 @@ void drawGearbox(ui::Ui& u, const sim::Snapshot& s, float x, float y, float w) {
     u.text("ROAD SPEED", x, y + 68.0f, 13, pal.dim);
     u.right(fmt("%.0f km/h", s.speedKph), x + w, y + 64.0f, 22, pal.text);
 
-    u.text("CLUTCH", x, y + 100.0f, 13, pal.dim);
+    // The pedal and what the disc is doing about it are two different things,
+    // and with a manual clutch both matter: the pedal is where your foot is,
+    // the clamp is how much torque the disc can hold there.
+    u.text("CLUTCH PEDAL", x, y + 100.0f, 13, pal.dim);
     u.rect(x + w * 0.45f, y + 100.0f, w * 0.55f, 10.0f, pal.grid);
-    u.rect(x + w * 0.45f, y + 100.0f, w * 0.55f * std::clamp(s.clutchLock, 0.0f, 1.0f),
+    u.rect(x + w * 0.45f, y + 100.0f, w * 0.55f * std::clamp(s.clutchPedal, 0.0f, 1.0f),
+           10.0f, pal.intake);
+
+    u.text("CLAMP", x, y + 118.0f, 13, pal.dim);
+    u.rect(x + w * 0.45f, y + 118.0f, w * 0.55f, 10.0f, pal.grid);
+    u.rect(x + w * 0.45f, y + 118.0f, w * 0.55f * std::clamp(s.clutchLock, 0.0f, 1.0f),
            10.0f, std::abs(s.clutchSlip) > 120.0f ? pal.alert : pal.good);
-    u.text(s.gear == 0 ? "neutral"
-                       : (std::abs(s.clutchSlip) > 120.0f ? "slipping" : "locked"),
-           x, y + 118.0f, 12, pal.dim);
-    u.right(fmt("%.0f N m at the wheels", s.wheelTorque), x + w, y + 118.0f, 12, pal.dim);
+
+    const char* state = s.gearGrind > 0.05f ? "clutch it to change gear"
+                      : s.gear == 0         ? "neutral"
+                      : s.clutchLock < 0.02f ? "disengaged"
+                      : std::abs(s.clutchSlip) > 120.0f ? "slipping"
+                                                        : "locked";
+    u.text(state, x, y + 136.0f, 12,
+           s.gearGrind > 0.05f ? pal.alert : pal.dim);
+    u.right(fmt("%.0f N m at the wheels", s.wheelTorque), x + w, y + 136.0f, 12, pal.dim);
 }
 
 void drawBar(ui::Ui& u, const std::string& label, float value01, float x, float y,
@@ -752,6 +766,12 @@ void drawLamps(ui::Ui& u, const sim::Snapshot& s, const sim::EngineParams& p,
         {"OIL",   s.oilPressure < 0.9f && s.rpm > 300.0f, pal.alert},
         {"COLD",  s.oilTemp < static_cast<float>(p.oilTempTarget) - 25.0f, pal.intake},
         {"BOOST", s.boost > 5.0f, pal.good},
+        // Three things only a driver-operated clutch can produce: an engine
+        // dragged to a stop, tyres turning faster than the road, and a lever
+        // pushed at a gearset that is still spinning.
+        {"STALL", s.stalled, pal.alert},
+        {"SPIN",  s.wheelSlip > 0.30f, pal.alert},
+        {"GRIND", s.gearGrind > 0.05f, pal.alert},
         {"LIMIT", s.rpm > static_cast<float>(p.redline) - 100.0, pal.alert},
     };
     const int n = static_cast<int>(sizeof(lamps) / sizeof(lamps[0]));
@@ -791,13 +811,26 @@ int main() {
     ui::Ui gui(font, palette);
     ui::Editor editor;
 
+    // Controllers. Whatever was bound last time wins over the guess made from
+    // looking at the device, so a pad that needed correcting stays corrected.
+    input::Gamepad pad;
+    const std::string padPath = input::bindingsPath();
+    if (input::loadBindings(pad.bindings(), padPath)) editor.padLoaded = true;
+    pad.start();
+
     sound.setVolume(60.0f);
     sound.play();                             // the physics runs on the audio thread
 
+    // Keyboard pedals. A key is a switch and a pedal is not, so each one is
+    // slewed at the rate a foot moves; an analog control is read straight and
+    // must not be slewed, which is why they are kept apart and combined below.
+    float throttleKey = 0.0f;
+    float brakeKey = 0.0f;
+    float clutchKey = 0.0f;
     float throttleCmd = 0.0f;
     float brakeCmd = 0.0f;
+    float clutchCmd = 0.0f;
     bool  ignition = true;
-    int   gearShown = 0;
     bool  fullscreen = false;
     bool  pendingChange = false;
     bool  forceApply = false;
@@ -813,7 +846,10 @@ int main() {
         in.fine = sf::Keyboard::isKeyPressed(sf::Keyboard::Key::LShift) ||
                   sf::Keyboard::isKeyPressed(sf::Keyboard::Key::RShift);
 
+        pad.update(dt);
+
         while (const std::optional event = window.pollEvent()) {
+            pad.handleEvent(*event);
             if (event->is<sf::Event::Closed>()) window.close();
             if (const auto* rs = event->getIf<sf::Event::Resized>()) {
                 (void)rs;
@@ -852,8 +888,12 @@ int main() {
                     switch (key->code) {
                         case K::Escape: window.close(); break;
                         case K::I: ignition = !ignition; sound.setIgnition(ignition); break;
-                        case K::E: sound.requestGear(std::min(gearShown + 1, 8)); break;
-                        case K::Q: sound.requestGear(std::max(gearShown - 1, 0)); break;
+                        // Relative shifts are resolved against the gear the
+                        // simulation is in, not the one on screen: the gearbox
+                        // may have just refused a change, and the snapshot
+                        // showing that is a chunk behind.
+                        case K::E: sound.requestShift(1); break;
+                        case K::Q: sound.requestShift(-1); break;
                         case K::N: case K::Num0: sound.requestGear(0); break;
                         case K::Num1: sound.requestGear(1); break;
                         case K::Num2: sound.requestGear(2); break;
@@ -870,22 +910,55 @@ int main() {
         }
 
         const bool driving = !gui.textFocused();
+        // While a control is being rebound, the pad is answering a question
+        // rather than driving the car.
+        const bool padDrives = !pad.learning();
         const bool wantThrottle = driving &&
             (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::W) ||
              sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Up));
         const bool wantBrake = driving &&
             (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Down) ||
              sf::Keyboard::isKeyPressed(sf::Keyboard::Key::B));
-        // A pedal is not a switch: ramp so the manifold has time to fill.
-        throttleCmd += ((wantThrottle ? 1.0f : 0.0f) - throttleCmd) * std::min(1.0f, dt * 9.0f);
-        brakeCmd    += ((wantBrake ? 1.0f : 0.0f) - brakeCmd) * std::min(1.0f, dt * 8.0f);
+        const bool wantClutch = driving &&
+            (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::C) ||
+             sf::Keyboard::isKeyPressed(sf::Keyboard::Key::LControl));
+
+        // A key is a switch, so it is slewed at the speed a foot can move a
+        // pedal. Linear rather than exponential, because a clutch that only
+        // ever approaches the floor never frees the gearset.
+        auto slew = [&](float& v, bool want, float perSecond) {
+            const float limit = perSecond * dt;
+            v += std::clamp((want ? 1.0f : 0.0f) - v, -limit, limit);
+        };
+        slew(throttleKey, wantThrottle, 6.0f);
+        slew(brakeKey,    wantBrake,    7.0f);
+        slew(clutchKey,   wantClutch,   4.5f);
+
+        // Whichever is asking for more wins, so a pad and the keyboard can be
+        // used interchangeably without either having to be switched off.
+        throttleCmd = throttleKey;
+        brakeCmd    = brakeKey;
+        clutchCmd   = clutchKey;
+        if (padDrives) {
+            throttleCmd = std::max(throttleCmd, pad.value(input::Control::Throttle));
+            brakeCmd    = std::max(brakeCmd,    pad.value(input::Control::Brake));
+            clutchCmd   = std::max(clutchCmd,   pad.value(input::Control::Clutch));
+            if (pad.pressed(input::Control::ShiftUp))   sound.requestShift(1);
+            if (pad.pressed(input::Control::ShiftDown)) sound.requestShift(-1);
+            if (pad.pressed(input::Control::Neutral))   sound.requestGear(0);
+            if (pad.pressed(input::Control::Ignition)) {
+                ignition = !ignition;
+                sound.setIgnition(ignition);
+            }
+        }
         sound.setThrottle(throttleCmd);
         sound.setBrake(brakeCmd);
-        sound.setStarter(driving && sf::Keyboard::isKeyPressed(sf::Keyboard::Key::S));
+        sound.setClutch(clutchCmd);
+        sound.setStarter((driving && sf::Keyboard::isKeyPressed(sf::Keyboard::Key::S)) ||
+                         (padDrives && pad.held(input::Control::Starter)));
 
         const sim::Snapshot s = sound.snapshot();
         const sim::CylinderView& c1 = s.cyl[0];
-        gearShown = s.gear;
 
         // Appearance is not physics: it takes effect the moment it is edited.
         palette = ui::makePalette(design.theme, design.accentHue, design.blockShade,
@@ -960,18 +1033,21 @@ int main() {
                     s.valveFloat > 0.02f ? palette.alert : palette.text);
         gui.readout("IDLE VALVE", fmt("%.0f %%", s.idleValve * 100.0f));
         gui.readout("CLUTCH SLIP", fmt("%.0f rpm", s.clutchSlip));
+        gui.readout("WHEEL SLIP", fmt("%.0f %%", s.wheelSlip * 100.0f),
+                    s.wheelSlip > 0.30f ? palette.alert : palette.text);
         gui.readout("KNOCK", fmt("%.0f %%", s.knock * 100.0f),
                     s.knock > 0.05f ? palette.alert : palette.text);
 
-        drawBar(gui, "THROTTLE", s.throttle, rx, 420.0f, rw, palette.accent);
-        drawBar(gui, "BRAKE", s.brake, rx, 458.0f, rw, palette.exhaust);
-        drawLamps(gui, s, params, rx, 486.0f, rw);
+        drawBar(gui, "THROTTLE", s.throttle, rx, 404.0f, rw, palette.accent);
+        drawBar(gui, "BRAKE", s.brake, rx, 438.0f, rw, palette.exhaust);
+        drawBar(gui, "CLUTCH", s.clutchPedal, rx, 472.0f, rw, palette.intake);
+        drawLamps(gui, s, params, rx, 494.0f, rw);
 
         gui.text(design.name, ix + 18.0f, 500.0f, 15, palette.accent);
         gui.text(ignition ? "IGNITION ON" : "IGNITION OFF", ix + 18.0f, 522.0f, 13,
                  ignition ? palette.good : palette.alert);
-        gui.text("W throttle   DOWN brake   S starter   Q/E shift   0-8 gear   "
-                 "I ignition   TAB editor   ESC quit",
+        gui.text("W throttle   DOWN brake   C clutch   S starter   Q/E shift   "
+                 "0-8 gear   I ignition   TAB editor   ESC quit",
                  ix + 18.0f, 544.0f, 12, palette.dim);
 
         // ---- Plots ----------------------------------------------------------
@@ -981,7 +1057,7 @@ int main() {
 
         // ---- Editor ---------------------------------------------------------
         if (editor.visible) {
-            const ui::EditorResult res = editor.draw(gui, design, dyno, pendingChange, dt);
+            const ui::EditorResult res = editor.draw(gui, design, dyno, pad, pendingChange, dt);
             if (res.changed) { pendingChange = true; applyTimer = 0.18f; }
             if (res.revert)  { design = applied; pendingChange = false; forceApply = false; }
             if (res.apply)   { pendingChange = true; forceApply = true; }

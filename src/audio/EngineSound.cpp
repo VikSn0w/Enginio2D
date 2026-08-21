@@ -295,8 +295,14 @@ bool EngineSound::onGetData(Chunk& chunk) {
     m_engine.setStarter(m_starterCmd.load(std::memory_order_relaxed));
     m_engine.setIgnition(m_ignitionCmd.load(std::memory_order_relaxed));
     m_engine.drivetrain().setBrake(m_brakeCmd.load(std::memory_order_relaxed));
+    m_engine.drivetrain().setClutchPedal(m_clutchCmd.load(std::memory_order_relaxed));
+    // The pedal has to be applied before the lever moves: whether the gearbox
+    // will accept a change is decided by where the clutch is at that moment.
     const int gearReq = m_gearRequest.exchange(-1, std::memory_order_relaxed);
     if (gearReq >= 0) m_engine.drivetrain().setGear(gearReq);
+    const int shift = m_shiftDelta.exchange(0, std::memory_order_relaxed);
+    if (shift != 0)
+        m_engine.drivetrain().setGear(m_engine.drivetrain().gear() + shift);
 
     const float gain = m_gain.load(std::memory_order_relaxed);
     std::size_t head = m_scopeHead.load(std::memory_order_relaxed);

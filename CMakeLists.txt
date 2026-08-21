@@ -23,6 +23,7 @@ find_package(SFML 3.1 REQUIRED COMPONENTS Graphics Audio Window System HINTS "de
 
 add_executable(Enginio2D
         src/app/main.cpp
+        src/input/Gamepad.cpp
         src/sim/Engine.cpp
         src/sim/EngineDesign.cpp
         src/sim/Drivetrain.cpp

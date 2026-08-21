@@ -346,6 +346,13 @@ void clampDesign(EngineDesign& d) {
     d.driveShare     = std::clamp(d.driveShare, 0.15, 1.00);
     d.clutchCapacity = std::clamp(d.clutchCapacity, 40.0, 3000.0);
     d.brakeTorque    = std::clamp(d.brakeTorque, 200.0, 12000.0);
+    // The clutch has to have some travel left between letting go and being
+    // fully home, or there is nothing to feather a launch on.
+    d.clutchFreePlay = std::clamp(d.clutchFreePlay, 0.0, 0.80);
+    d.clutchBite     = std::clamp(d.clutchBite, d.clutchFreePlay + 0.08, 0.95);
+    d.cgHeightRatio  = std::clamp(d.cgHeightRatio, 0.0, 0.60);
+    d.wheelInertia   = std::clamp(d.wheelInertia, 0.15, 30.0);
+    d.transmissionEff= std::clamp(d.transmissionEff, 0.60, 1.00);
 
     d.theme      = idx(d.theme, static_cast<int>(ThemeKind::Count));
     d.accentHue  = std::clamp(d.accentHue, 0.0, 360.0);
@@ -542,8 +549,15 @@ DrivetrainParams drivetrainFromDesign(const EngineDesign& din) {
     t.tyreGrip       = d.tyreGrip;
     t.driveShare     = d.driveShare;
     t.brakeTorque    = d.brakeTorque;
-    t.lockRpm        = std::clamp(d.idleRpm * 1.55, 700.0, 4000.0);
-    t.slipRpm        = std::clamp(d.idleRpm * 0.65, 250.0, 2000.0);
+    t.clutchFreePlay = d.clutchFreePlay;
+    t.clutchBite     = d.clutchBite;
+    t.driveRear      = d.driveRear;
+    t.cgHeightRatio  = d.cgHeightRatio;
+    t.wheelInertia   = d.wheelInertia;
+    t.transmissionEff= d.transmissionEff;
+    // The lever will not go in until the clutch is most of the way to the
+    // point where it has let go.
+    t.shiftClutch    = std::clamp(d.clutchBite * 0.9, 0.15, 0.9);
     return t;
 }
 
@@ -1081,7 +1095,7 @@ namespace {
     X(primaryLength) X(primaryDia) X(collectorVol) X(header) X(muffler)        \
     X(gearCount) X(finalDrive) X(wheelRadius) X(vehicleMass) X(dragArea)       \
     X(tyreGrip) X(driveShare)                                                  \
-    X(clutchCapacity) X(brakeTorque)                                           \
+    X(clutchCapacity) X(brakeTorque)                                               X(clutchFreePlay) X(clutchBite) X(driveRear) X(cgHeightRatio)                  X(wheelInertia) X(transmissionEff)                                         \
     X(theme) X(accentHue) X(coverHue) X(coverSat) X(blockShade)                \
     X(showCutaway) X(showTopView)
 

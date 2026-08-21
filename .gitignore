@@ -2,3 +2,6 @@ build/
 cmake-build-*/
 .idea/
 *.user
+
+# Control bindings are per person and per device, not part of the project.
+controls.json

@@ -18,8 +18,12 @@ const sf::FloatRect kSide({944.0f, kBodyY}, {456.0f, kBodyH});
 
 const char* kTabNames[] = {"LAYOUT", "BOTTOM END", "HEAD & VALVES", "FUEL & SPARK",
                            "OIL & FRICTION", "INDUCTION", "EXHAUST", "DRIVETRAIN",
-                           "APPEARANCE"};
-constexpr int kTabCount = 9;
+                           "CONTROLS", "APPEARANCE"};
+constexpr int kTabCount = 10;
+// Controls sit between the drivetrain and the appearance, because binding a
+// clutch pedal belongs next to specifying the clutch and nowhere near choosing
+// a colour scheme.
+constexpr int kControlsTab = 8;
 
 std::string fmt(const char* spec, double v) {
     char buf[96];
@@ -54,9 +58,13 @@ void Editor::tab(Ui& ui, int index, const char* name, float x, float& y) {
 }
 
 EditorResult Editor::draw(Ui& ui, sim::EngineDesign& d, sim::Dyno& dyno,
-                          bool dirty, float dt) {
+                          input::Gamepad& pad, bool dirty, float dt) {
     EditorResult r;
     if (m_statusTimer > 0.0f) m_statusTimer -= dt;
+    if (m_padSaveFlash > 0.0f) m_padSaveFlash -= dt;
+    // Leaving the controls tab with a rebind still armed would swallow the next
+    // button press somewhere else entirely.
+    if (m_tab != kControlsTab && pad.learning()) pad.cancelLearn();
 
     const Palette& pal = ui.pal();
     const sim::DesignSummary sum = sim::summarise(d);
@@ -126,7 +134,7 @@ EditorResult Editor::draw(Ui& ui, sim::EngineDesign& d, sim::Dyno& dyno,
             pal.bg, pal.line, 1.0f);
     const int t = std::clamp(m_tab, 0, kTabCount - 1);
     ui.beginScroll(kBody, m_scroll[t], m_contentH[t]);
-    body(ui, d, r, sum, dyno);
+    body(ui, d, r, sum, dyno, pad);
     ui.endScroll();
 
     // ---- Sidebar -----------------------------------------------------------
@@ -165,7 +173,8 @@ EditorResult Editor::draw(Ui& ui, sim::EngineDesign& d, sim::Dyno& dyno,
 
 // ---------------------------------------------------------------------------
 void Editor::body(Ui& ui, sim::EngineDesign& d, EditorResult& r,
-                  const sim::DesignSummary& sum, const sim::Dyno& dyno) {
+                  const sim::DesignSummary& sum, const sim::Dyno& dyno,
+                  input::Gamepad& pad) {
     const Palette& pal = ui.pal();
     const float top = kBodyY + 6.0f;
     auto touch = [&](bool c) { if (c) r.changed = true; };
@@ -442,8 +451,22 @@ void Editor::body(Ui& ui, sim::EngineDesign& d, EditorResult& r,
         touch(ui.slider("WHEEL RADIUS", d.wheelRadius, 0.15, 0.75, "%.3f m", 0.005));
         touch(ui.slider("TYRE GRIP", d.tyreGrip, 0.30, 2.20, "%.2f", 0.01));
         touch(ui.slider("WEIGHT ON DRIVEN WHEELS", d.driveShare, 0.15, 1.00, "%.0f %%", 0.01));
-        touch(ui.slider("CLUTCH CAPACITY", d.clutchCapacity, 40.0, 3000.0, "%.0f N m", 10.0));
+        touch(ui.toggle("REAR WHEEL DRIVE", d.driveRear));
+        touch(ui.slider("CG HEIGHT / WHEELBASE", d.cgHeightRatio, 0.0, 0.60, "%.2f", 0.01));
+        ui.note("How much weight moves on to the driven axle");
+        ui.note("under acceleration. Zero disables the transfer.");
+        touch(ui.slider("WHEEL INERTIA", d.wheelInertia, 0.15, 30.0, "%.2f kg m2", 0.05));
+        touch(ui.slider("TRANSMISSION EFFICIENCY", d.transmissionEff, 0.60, 1.00, "%.0f %%", 0.01));
         touch(ui.slider("BRAKE TORQUE", d.brakeTorque, 200.0, 12000.0, "%.0f N m", 50.0));
+
+        ui.heading("CLUTCH");
+        touch(ui.slider("CLUTCH CAPACITY", d.clutchCapacity, 40.0, 3000.0, "%.0f N m", 10.0));
+        touch(ui.slider("FULLY HOME BELOW", d.clutchFreePlay, 0.0, 0.80, "%.2f pedal", 0.01));
+        touch(ui.slider("LETS GO ABOVE", d.clutchBite, 0.10, 0.95, "%.2f pedal", 0.01));
+        ui.note("The travel between the two is the bite point:");
+        ui.note("a wider band is easier to feather a launch on.");
+        ui.readout("WILL SHIFT ABOVE",
+                   fmt("%.2f pedal", std::clamp(d.clutchBite * 0.9, 0.15, 0.9)));
         ui.heading("AT THE LIMITER");
         for (int i = 0; i < d.gearCount; ++i) {
             const double ratio = d.gears[static_cast<std::size_t>(i)] * d.finalDrive;
@@ -474,6 +497,12 @@ void Editor::body(Ui& ui, sim::EngineDesign& d, EditorResult& r,
             ui.note("more speed.");
         }
         endB = ui.cursorY();
+        break;
+    }
+    case kControlsTab: {   // ------------------------------------------ CONTROLS
+        controlsTab(ui, pad, top);
+        endA = ui.cursorY();
+        endB = top;
         break;
     }
     default: {  // ---------------------------------------------- APPEARANCE
@@ -507,6 +536,144 @@ void Editor::body(Ui& ui, sim::EngineDesign& d, EditorResult& r,
 
     m_contentH[std::clamp(m_tab, 0, kTabCount - 1)] =
         std::max(endA, endB) - kBodyY + 24.0f;
+}
+
+// ---------------------------------------------------------------------------
+// Controls.
+//
+// Nothing here can be assumed. SFML hands over numbered axes and buttons with
+// no indication of what they are, and the same physical trigger is a different
+// axis on a different pad - so the only honest interface is one that shows what
+// the device is actually reporting and lets each function be pointed at the
+// right control by moving it.
+// ---------------------------------------------------------------------------
+void Editor::controlsTab(Ui& ui, input::Gamepad& pad, float top) {
+    const Palette& pal = ui.pal();
+
+    ui.column(kColA, top, 640.0f);
+    ui.heading("DEVICE");
+    if (pad.connected()) {
+        ui.readout("CONNECTED", pad.deviceName().empty()
+                                    ? ("pad " + std::to_string(pad.device() + 1))
+                                    : pad.deviceName(), pal.good);
+        ui.readout("BUTTONS", std::to_string(pad.buttonCount()));
+        ui.readout("BINDINGS", padLoaded ? "loaded from controls.json"
+                                         : "guessed from the device", pal.dim);
+    } else {
+        ui.readout("CONNECTED", "nothing plugged in", pal.dim);
+        ui.note("The keyboard drives the car on its own:");
+        ui.note("W throttle, DOWN brake, C clutch, S starter.");
+    }
+
+    // ---- Bindings -----------------------------------------------------------
+    ui.heading("BINDINGS");
+    ui.note("REBIND, then move the control you want.");
+    const float x = ui.columnX();
+    const float w = ui.columnW();
+    for (int i = 0; i < input::kControlCount; ++i) {
+        const auto c = static_cast<input::Control>(i);
+        const float y = ui.cursorY();
+        const bool learning = pad.learning() && pad.learnTarget() == c;
+
+        ui.text(input::controlName(c), x, y + 7.0f, 13, pal.text);
+
+        // What the binding reads right now, as a bar for the pedals and a lamp
+        // for the switches. Watching it move is the only way to be sure the
+        // right thing got bound.
+        const float v = pad.value(c);
+        const float barX = x + 150.0f, barW = 120.0f;
+        if (input::controlIsAxis(c)) {
+            ui.rect(barX, y + 8.0f, barW, 12.0f, pal.grid);
+            ui.rect(barX, y + 8.0f, barW * std::clamp(v, 0.0f, 1.0f), 12.0f,
+                    c == input::Control::Throttle ? pal.good
+                    : c == input::Control::Brake  ? pal.exhaust : pal.intake);
+        } else {
+            ui.rect(barX, y + 8.0f, 26.0f, 12.0f, v > 0.5f ? pal.accent : pal.grid);
+        }
+
+        ui.text(learning ? "move it now..." : pad.bindings()[c].label(),
+                barX + barW + 14.0f, y + 7.0f, 12,
+                learning ? pal.accent : (pad.bindings()[c].bound() ? pal.dim : pal.alert));
+
+        if (ui.button(learning ? "CANCEL" : "REBIND", x + w - 158.0f, y + 2.0f,
+                      86.0f, 24.0f, learning)) {
+            if (learning) pad.cancelLearn();
+            else          pad.beginLearn(c);
+        }
+        if (ui.button("CLEAR", x + w - 66.0f, y + 2.0f, 66.0f, 24.0f))
+            pad.clearBinding(c);
+        ui.skip(32.0f);
+    }
+
+    // ---- Feel ---------------------------------------------------------------
+    ui.column(kColA, ui.cursorY() + 14.0f, kColW);
+    ui.heading("FEEL");
+    {
+        // The sliders edit doubles, the bindings hold floats, so the value has
+        // to be copied out and back. That puts the edited variable on the
+        // stack, which cannot be the control's identity - so each one is given
+        // the address of the field it really belongs to.
+        double dz = pad.bindings().deadzone;
+        if (ui.slider("DEAD ZONE", dz, 0.0, 0.40, "%.2f", 0.01, &pad.bindings().deadzone))
+            pad.bindings().deadzone = static_cast<float>(dz);
+        double g = pad.bindings().clutchGamma;
+        if (ui.slider("CLUTCH TRAVEL SHAPE", g, 0.40, 3.00, "%.2f", 0.05,
+                      &pad.bindings().clutchGamma))
+            pad.bindings().clutchGamma = static_cast<float>(g);
+        ui.note("A stick is far shorter than a clutch pedal.");
+        ui.note("Above 1 the bite point spreads over more of it.");
+    }
+
+    const float by = ui.cursorY() + 8.0f;
+    if (ui.button("SAVE BINDINGS", ui.columnX(), by, 150.0f, 28.0f)) {
+        if (input::saveBindings(pad.bindings(), input::bindingsPath())) {
+            padLoaded = true;
+            m_padSaveFlash = 2.5f;
+            status("Controls saved to " + input::bindingsPath());
+        } else {
+            status("Could not write " + input::bindingsPath());
+        }
+    }
+    if (ui.button("USE DEFAULTS", ui.columnX() + 160.0f, by, 150.0f, 28.0f)) {
+        const float dz = pad.bindings().deadzone;
+        const float gm = pad.bindings().clutchGamma;
+        input::Bindings b = input::defaultBindings(pad.device());
+        b.deadzone = dz;
+        b.clutchGamma = gm;
+        pad.setBindings(b);
+        status("Bindings reset to what the device looks like");
+    }
+    if (m_padSaveFlash > 0.0f)
+        ui.text("saved", ui.columnX() + 322.0f, by + 7.0f, 13, pal.good);
+    ui.skip(40.0f);
+
+    // ---- Raw device readings ------------------------------------------------
+    // The last resort when a binding will not take: if nothing here moves, the
+    // problem is between the device and the driver, not in the bindings.
+    if (pad.connected()) {
+        ui.heading("WHAT THE DEVICE REPORTS");
+        static const char* const kAxes[] = {"X", "Y", "Z", "R", "U", "V", "PovX", "PovY"};
+        for (int a = 0; a < 8; ++a) {
+            const float raw = pad.rawAxis(a);
+            const float ry = ui.cursorY();
+            ui.text(kAxes[a], ui.columnX(), ry + 2.0f, 12, pal.dim);
+            const float cx = ui.columnX() + 60.0f, cw = 180.0f;
+            ui.rect(cx, ry + 4.0f, cw, 10.0f, pal.grid);
+            // Centre-zero, because that is how the reading is expressed.
+            const float mid = cx + cw * 0.5f;
+            const float half = cw * 0.5f * std::clamp(raw / 100.0f, -1.0f, 1.0f);
+            ui.rect(half < 0.0f ? mid + half : mid, ry + 4.0f, std::abs(half), 10.0f, pal.accent);
+            ui.text(fmt("%.0f", raw), cx + cw + 12.0f, ry + 2.0f, 12, pal.dim);
+            ui.skip(20.0f);
+        }
+        const int n = pad.buttonCount();
+        const float ry = ui.cursorY() + 6.0f;
+        ui.text("BUTTONS", ui.columnX(), ry, 12, pal.dim);
+        for (int b = 0; b < n && b < 24; ++b)
+            ui.rect(ui.columnX() + 60.0f + b * 16.0f, ry - 2.0f, 12.0f, 12.0f,
+                    pad.rawButton(b) ? pal.accent : pal.grid);
+        ui.skip(30.0f);
+    }
 }
 
 // ---------------------------------------------------------------------------

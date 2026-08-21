@@ -33,16 +33,42 @@ too — an unoptimised build will not keep up with the audio thread.
 | --- | --- |
 | `Tab` | open / close the engine editor |
 | `W` / `Up` | throttle (ramps like a pedal, not a switch) |
-| `S` | starter motor |
 | `Down` / `B` | brake |
+| `C` / `Ctrl` | clutch |
+| `S` | starter motor |
 | `Q` / `E` | shift down / up |
 | `0`-`8`, `N` | select gear directly (0 or N is neutral) |
 | `I` | ignition on/off |
 | `F11` | fullscreen |
 | `Esc` | quit |
 
-Hold `S` for a moment, and it fires and settles to idle. Select first with `1`,
-then throttle: the clutch feeds itself in and the car pulls away.
+Hold `S` for a moment, and it fires and settles to idle.
+
+**The clutch is yours.** Nothing feeds it in for you, so pulling away is the
+job it actually is: hold `C`, select first, come off `C` while opening the
+throttle. Let it home at idle against a stationary car and the engine stalls,
+which is the correct answer. Drop it at 6000 rpm and the tyres go instead.
+The gearbox will not accept a gear until the pedal is far enough down to free
+the gearset — the **GRIND** lamp says that is what just happened.
+
+### Controllers
+
+Pads, wheels and pedal boxes are read through SFML's joystick interface and
+work alongside the keyboard: whichever is asking for more of a pedal wins, so
+neither has to be switched off. Throttle, brake and clutch are analog, which is
+most of the point — a clutch is very hard to feather with a key.
+
+Bindings are guessed from what the device reports when nothing is being
+touched, which is enough to tell an Xbox pad (both triggers sharing one axis,
+pulling opposite ways) from a DualShock (a trigger each, resting at the bottom
+of their travel) from a wheel. Anything the guess gets wrong is fixed in the
+**Controls** tab of the editor: press **Rebind**, move the control you want,
+and it takes the direction you moved it as "fully pressed". The same tab shows
+every axis and button the device is reporting live, which is the fastest way to
+find out whether a control is being seen at all.
+
+**Save bindings** writes `controls.json` beside `presets/`, and it is read at
+startup. It is a per-person file, not part of an engine design.
 
 ## The editor
 
@@ -52,7 +78,7 @@ With **live apply** on, the engine is rebuilt about a fifth of a second after
 you stop moving a control, so you hear what you changed. Turn it off and
 changes wait for **Apply**.
 
-Nine tabs, grouped the way an engine is actually specified:
+Ten tabs, grouped the way an engine is actually specified:
 
 - **Layout** — inline, V, flat/boxer or W; 1 to 16 cylinders; bank angle; and
   the crank: even-fire, crossplane, or odd-fire on shared pins. A chart shows
@@ -81,10 +107,16 @@ Nine tabs, grouped the way an engine is actually specified:
 - **Exhaust** — header style, primary length and diameter, collector volume,
   and muffler. Both flow and sound follow.
 - **Drivetrain** — up to eight ratios, final drive, and the car: mass, drag
-  area, wheel radius, clutch capacity, brakes, tyre grip and how much of the
-  weight sits over the driven wheels. Torque beyond what the contact patch can
-  hold spins the tyre instead of accelerating anything. Top speed per gear is
-  listed.
+  area, wheel radius, brakes, tyre grip, how much of the weight sits over the
+  driven wheels, which end is driven, CG height over wheelbase, wheel inertia
+  and transmission efficiency. Torque beyond what the contact patch can hold
+  spins the tyre instead of accelerating anything. The clutch has its capacity
+  and its bite band: where in the pedal travel it is fully home and where it
+  lets go, which is what a launch is feathered on. Top speed per gear is listed.
+- **Controls** — what each pedal and button on a connected device is bound to,
+  with a live reading beside every one, a dead zone, a clutch travel curve, and
+  the raw axes and buttons the device is reporting. Not part of an engine
+  design: it saves separately to `controls.json`.
 - **Appearance** — theme, accent hue, block and cam-cover colour, and which
   views to show. These apply instantly and never rebuild the engine.
 
@@ -346,11 +378,36 @@ driving a saturator harder turns it into a constant buzz. About 26 dB survives.
 ### Drivetrain — `src/sim/Drivetrain.cpp`
 
 Up to eight ratios plus neutral, a final drive, and a car with aerodynamic drag
-and rolling resistance. The clutch is a **slipping friction coupling**, not a
-rigid link: it saturates at its torque capacity, opens below a few hundred rpm
-and during a shift, and comes home as engine or road speed rises. That is what
-lets the engine idle in gear, pull away from rest, and be shifted without the
-crank speed stepping. Engine braking on a closed throttle falls out for free.
+and rolling resistance.
+
+The clutch is a **slipping friction coupling driven by the pedal**, not by the
+simulation. Clamp force follows pedal travel through a bite band — fully home
+below one position, free above another — and the torque it passes is Coulomb
+friction regularised over about ten rpm of slip, so a clutch that is home
+behaves as a shaft rather than as a spring. The friction impulse is limited to
+what the reduced inertia of the two sides can absorb in one step, which is what
+keeps a 1500 N m clutch on a light flywheel stable at any step size and only
+ever binds within a few rpm of lock-up.
+
+Nothing engages it for you, and that is the point: an engine can be stalled,
+a launch has to be fed, and a gear will not go in until the pedal has freed the
+gearset. Engine braking on a closed throttle falls out for free.
+
+The **driven wheels carry their own rotational speed** rather than being pinned
+to road speed, and the tyre between them and the road is a simplified Pacejka
+curve on slip ratio: force rises steeply, peaks around a fifth of slip, then
+falls away to the sliding coefficient. The slip ratio is referred to whichever
+of the two surfaces is moving faster, not to road speed alone — referring it to
+road speed makes a car pulling away from rest read as fully sliding the instant
+the wheel turns at all.
+
+That is what makes wheelspin cost something. Without a wheel state, a spinning
+tyre loads the engine exactly as a gripping one does, so dropping the clutch in
+first produces a shove instead of noise; with it, the surplus torque goes into
+spinning the wheel, the engine revs, and the car does not. Normal load on the
+driven axle includes longitudinal **weight transfer**, which is why a
+rear-drive car hooks up harder the more it accelerates and a front-drive one
+runs out of grip doing the same thing.
 
 ### Threading
 
@@ -373,8 +430,9 @@ V12 at 10000 rpm cost three times what it needed to.
 src/sim/Engine.{h,cpp}          thermodynamics, gas exchange, knock, boost, crank dynamics
 src/sim/EngineDesign.{h,cpp}    the editable specification, and what it derives
 src/sim/Dyno.{h,cpp}            steady-state power sweep on a worker thread
-src/sim/Drivetrain.{h,cpp}      clutch, gearbox, vehicle
+src/sim/Drivetrain.{h,cpp}      clutch, gearbox, tyres, vehicle
 src/audio/EngineSound.{h,cpp}   pipe acoustics and mechanical noise; audio-rate driver
+src/input/Gamepad.{h,cpp}       joystick bindings, auto-detection and persistence
 src/ui/Widgets.{h,cpp}          immediate-mode controls, palette, clipping and scrolling
 src/ui/Editor.{h,cpp}           the editor panel, firing chart and dyno chart
 src/app/main.cpp                SFML window and all views
@@ -402,6 +460,18 @@ waveform.
 `enginio_validate` dynos every preset, leaves each one idling on its own, and
 compares the result against `tools/baselines.txt`. It needs no window and no
 audio device.
+
+It then **drives** each one: a scripted driver selects first, feeds the clutch
+out over a second at part throttle, and runs up through the gears, reporting
+top speed, 0-100 km/h, peak slip and how much of the run the tyres spent past
+the grip peak. Those have no baselines - a launch is a closed loop around a
+simulated driver, so the useful assertion is not that the number matches
+yesterday but that the thing works at all. Four things are asserted outright:
+the car gets moving without stalling, dropping the clutch at idle either stalls
+the engine or moves the car, holding the pedal down isolates the engine from
+the car entirely, and the gearbox refuses a gear with the pedal up. Each is a
+way the clutch could be quietly not connected to anything while every gauge
+still read correctly.
 
 ```
 build\enginio_validate.exe            check, and return non-zero if anything moved
@@ -439,10 +509,14 @@ it is the clearest statement of what the change actually did.
   stoichiometric mixture against a rich one.
 - No thermal model of the block: wall temperature is a constant, so the oil
   warms up but there is no cold-start enrichment.
-- No tyre model: wheel torque becomes acceleration directly, so first gear has
-  grip it would not have in reality.
-- Shifts are instant selections with a fixed clutch-out time; there is no
-  synchro or throttle blip modelling.
+- The tyre model is longitudinal only, on one driven axle, with no relaxation
+  length: there is no cornering, no individual wheels, and no differential.
+- Weight transfer uses a single CG-height-over-wheelbase number and never lifts
+  a wheel, so it cannot wheelie or nose-dive.
+- A refused gear change is silent apart from the lamp; there is no synchro
+  model, no throttle blip, and no way to shift without the clutch even when the
+  speeds do happen to match.
+- There is no reverse gear, and the car cannot roll backwards.
 - Only cylinder 1 is drawn in section; the others appear in the top view.
 - Applying an edit re-seeds the gas states at ambient, so the engine stumbles
   for a cycle or two before it settles.

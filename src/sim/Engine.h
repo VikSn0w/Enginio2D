@@ -348,10 +348,14 @@ struct Snapshot {
     int   gear             = 0;    // 0 = neutral
     int   gearCount        = 6;
     float speedKph         = 0.0f;
-    float clutchLock       = 0.0f; // 0..1
+    float clutchPedal      = 0.0f; // 0..1, 0 is the pedal up
+    float clutchLock       = 0.0f; // 0..1, clamp force in use
     float clutchSlip       = 0.0f; // rpm across the clutch
     float wheelTorque      = 0.0f; // N m
+    float wheelSlip        = 0.0f; // 0 = gripping, 1 = spinning
     float brake            = 0.0f;
+    float gearGrind        = 0.0f; // decays after a shift the gearbox refused
+    bool  stalled          = false;
     int   cylinderCount    = 0;
     std::array<CylinderView, kMaxCylinders> cyl{};
 };

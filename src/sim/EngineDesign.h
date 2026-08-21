@@ -144,6 +144,16 @@ struct EngineDesign {
     double driveShare     = 0.52;   // share of weight over the driven wheels
     double clutchCapacity = 340.0;  // N m
     double brakeTorque    = 2600.0; // N m at the wheels
+    // The clutch pedal is the driver's. These two say where in its travel the
+    // disc does anything: above the bite point it is free, below the free-play
+    // point it is fully clamped, and the band between them is what a launch is
+    // feathered on.
+    double clutchFreePlay = 0.18;   // pedal position at which it is fully home
+    double clutchBite     = 0.62;   // pedal position at which it lets go
+    bool   driveRear      = true;   // which end is driven
+    double cgHeightRatio  = 0.22;   // CG height / wheelbase, sets weight transfer
+    double wheelInertia   = 1.6;    // kg m^2, driven wheels, hubs, brakes, shafts
+    double transmissionEff= 0.92;   // gears and final drive
 
     // ---- Appearance --------------------------------------------------------
     int    theme       = static_cast<int>(ThemeKind::Graphite);

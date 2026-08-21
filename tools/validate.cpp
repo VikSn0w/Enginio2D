@@ -42,12 +42,153 @@ constexpr double kPowerTol = 0.04;   // fraction
 constexpr double kSpeedTol = 0.10;
 constexpr double kIdleTol  = 120.0;  // rpm
 
+std::string fmt(const char* spec, double v) {
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), spec, v);
+    return buf;
+}
+
 struct Measurement {
     double peakKW = 0.0, peakKWrpm = 0.0;
     double peakNm = 0.0, peakNmRpm = 0.0;
     double idleLo = 0.0, idleHi = 0.0, idleMean = 0.0;
     bool   stalled = false;
 };
+
+// What the car does, as opposed to what the engine does on a bench. The clutch
+// is the driver's now, and that is the one part of the simulation a dyno cannot
+// see: an engine that makes its power perfectly can still be attached to a
+// drivetrain that will not pull away, or to one that quietly pretends a
+// spinning tyre is a gripping one.
+struct DriveResult {
+    double topKph      = 0.0;   // reached within the run
+    double to100s      = 0.0;   // 0 if it never got there
+    double peakSlip    = 0.0;   // 0 = gripping throughout, 1 = spinning
+    double spinFraction= 0.0;   // share of the run spent past the grip peak
+    int    gearReached = 0;
+    bool   launched    = false;
+    bool   stalledOnLaunch = false;
+    // Dropping the clutch at idle against a stationary car has to do something:
+    // either stall the engine or move the car. Carrying on idling with the disc
+    // clamped and the car still would mean it is not coupled to anything.
+    bool   dumpCoupled = false;
+    // With the pedal on the floor the engine is on its own: full throttle must
+    // rev it and must not move the car. If this fails the clutch is not really
+    // a clutch, whatever the readout says.
+    bool   clutchIsolates = false;
+    // And the lever must not go into a gear with the pedal up.
+    bool   shiftNeedsClutch = false;
+};
+
+// Start the engine and let the idle settle.
+void crank(sim::Engine& e) {
+    e.setThrottle(0.0);
+    e.setStarter(true);
+    for (int s = 0; s < static_cast<int>(1.5 * 44100); ++s) e.advance(kDt);
+    e.setStarter(false);
+    for (int s = 0; s < static_cast<int>(3.0 * 44100); ++s) e.advance(kDt);
+}
+
+DriveResult drive(const sim::EngineDesign& d) {
+    DriveResult r;
+    const sim::EngineParams p = sim::paramsFromDesign(d);
+
+    // ---- Launch, then run up through the gears ------------------------------
+    {
+        sim::Engine e(p);
+        e.warmUp();
+        e.drivetrain().setParams(sim::drivetrainFromDesign(d));
+        crank(e);
+
+        double pedal = 1.0;          // clutch on the floor to select first
+        e.drivetrain().setClutchPedal(pedal);
+        for (int s = 0; s < static_cast<int>(0.4 * 44100); ++s) e.advance(kDt);
+        e.drivetrain().setGear(1);
+
+        double shiftTimer = -1.0;    // >= 0 while a gear change is under way
+        long   slipSamples = 0, spinSamples = 0;
+        const int total = static_cast<int>(12.0 * 44100);
+        for (int s = 0; s < total; ++s) {
+            const double t = s * kDt;
+            const double rpm = e.rpm();
+
+            if (shiftTimer >= 0.0) {
+                // Clutch in, lever across, clutch back out.
+                const double was = shiftTimer;
+                shiftTimer += kDt;
+                pedal = shiftTimer < 0.18 ? 1.0
+                                          : std::max(0.0, 1.0 - (shiftTimer - 0.18) / 0.30);
+                if (was < 0.16 && shiftTimer >= 0.16)
+                    e.drivetrain().setGear(e.drivetrain().gear() + 1);
+                if (pedal <= 0.0) shiftTimer = -1.0;
+                e.setThrottle(0.2);
+            } else {
+                // Feed the clutch out over the first second, as a launch is.
+                pedal = std::max(0.0, 1.0 - t / 1.0);
+                e.setThrottle(0.85);
+                if (rpm > d.redline * 0.94 &&
+                    e.drivetrain().gear() < e.drivetrain().gearCount())
+                    shiftTimer = 0.0;
+            }
+            e.drivetrain().setClutchPedal(pedal);
+            e.advance(kDt);
+
+            if (s % 64 == 0) {
+                const sim::Snapshot snap = e.snapshot();
+                r.topKph = std::max(r.topKph, static_cast<double>(snap.speedKph));
+                r.peakSlip = std::max(r.peakSlip, static_cast<double>(snap.wheelSlip));
+                // Peak slip is one sample and a hard launch always spikes it.
+                // How long the tyres spent past the grip peak is the number
+                // that says whether the traction model is doing anything.
+                ++slipSamples;
+                if (snap.wheelSlip > 0.30f) ++spinSamples;
+                r.gearReached = std::max(r.gearReached, snap.gear);
+                if (r.to100s == 0.0 && snap.speedKph >= 100.0) r.to100s = t;
+                if (snap.stalled && t > 1.5) r.stalledOnLaunch = true;
+            }
+        }
+        r.spinFraction = slipSamples ? static_cast<double>(spinSamples) / slipSamples : 0.0;
+        r.launched = r.topKph > 30.0 && !r.stalledOnLaunch;
+    }
+
+    // ---- Drop the clutch at idle with no throttle ---------------------------
+    {
+        sim::Engine e(p);
+        e.warmUp();
+        e.drivetrain().setParams(sim::drivetrainFromDesign(d));
+        crank(e);
+        e.drivetrain().setClutchPedal(1.0);
+        for (int s = 0; s < static_cast<int>(0.4 * 44100); ++s) e.advance(kDt);
+        e.drivetrain().setGear(1);
+        e.drivetrain().setClutchPedal(0.0);      // straight off the pedal
+        e.setThrottle(0.0);
+        for (int s = 0; s < static_cast<int>(3.0 * 44100); ++s) e.advance(kDt);
+        const sim::Snapshot snap = e.snapshot();
+        r.dumpCoupled = snap.rpm < 400.0f || snap.speedKph > 1.5f;
+    }
+
+    // ---- Hold the clutch down and open the throttle -------------------------
+    {
+        sim::Engine e(p);
+        e.warmUp();
+        e.drivetrain().setParams(sim::drivetrainFromDesign(d));
+        crank(e);
+        e.drivetrain().setClutchPedal(1.0);
+        for (int s = 0; s < static_cast<int>(0.4 * 44100); ++s) e.advance(kDt);
+        e.drivetrain().setGear(1);
+
+        // The lever went in with the pedal down; with it up it must not.
+        e.drivetrain().setClutchPedal(0.0);
+        r.shiftNeedsClutch = !e.drivetrain().setGear(2);
+        e.drivetrain().setClutchPedal(1.0);
+
+        e.setThrottle(1.0);
+        for (int s = 0; s < static_cast<int>(3.0 * 44100); ++s) e.advance(kDt);
+        const sim::Snapshot snap = e.snapshot();
+        r.clutchIsolates = snap.speedKph < 1.0f && snap.rpm > d.idleRpm * 1.5;
+    }
+    return r;
+}
 
 Measurement measure(const sim::EngineDesign& d) {
     Measurement m;
@@ -172,11 +313,14 @@ int main(int argc, char** argv) {
                                                            : readBaselines(path);
 
     std::vector<std::pair<std::string, Measurement>> results;
+    std::vector<std::pair<std::string, DriveResult>> drives;
     int failures = 0;
+    int driveFailures = 0;
 
     for (int i = 0; i < sim::presetCount(); ++i) {
         const sim::EngineDesign d = sim::preset(i);
         const Measurement m = measure(d);
+        drives.emplace_back(d.name, drive(d));
         results.emplace_back(d.name, m);
 
         std::printf("%-32s %6.1f kW @ %5.0f  %7.1f Nm @ %5.0f  idle %4.0f (%4.0f-%4.0f)",
@@ -230,8 +374,30 @@ int main(int argc, char** argv) {
         std::printf("\nwrote %s\n", path.c_str());
         return 0;
     }
+    // ---- The car -------------------------------------------------------------
+    // No baselines for these. A launch is a closed loop around a simulated
+    // driver, so the useful assertion is not that the number matches yesterday
+    // but that the thing works at all.
+    std::printf("\n%-32s %8s %8s %6s %7s %5s\n", "", "top kph", "0-100 s",
+                "slip", "spinning", "gear");
+    for (const auto& entry : drives) {
+        const DriveResult& r = entry.second;
+        std::printf("%-32s %8.0f %8s %5.0f%% %6.0f%% %5d   ",
+                    entry.first.c_str(), r.topKph,
+                    r.to100s > 0.0 ? fmt("%.1f", r.to100s).c_str() : "-",
+                    r.peakSlip * 100.0, r.spinFraction * 100.0, r.gearReached);
+        std::string bad;
+        if (!r.launched)    bad += r.stalledOnLaunch ? " stalled-on-launch" : " never-moved";
+        if (!r.dumpCoupled)      bad += " clutch-not-coupled";
+        if (!r.clutchIsolates)   bad += " clutch-does-not-release";
+        if (!r.shiftNeedsClutch) bad += " shifts-without-clutch";
+        if (bad.empty()) std::printf("ok\n");
+        else { std::printf("FAILED:%s\n", bad.c_str()); ++driveFailures; }
+    }
+
     if (list) return 0;
 
     std::printf("\n%d of %d presets changed or stalled\n", failures, sim::presetCount());
-    return failures == 0 ? 0 : 1;
+    std::printf("%d of %d presets failed to drive\n", driveFailures, sim::presetCount());
+    return (failures == 0 && driveFailures == 0) ? 0 : 1;
 }

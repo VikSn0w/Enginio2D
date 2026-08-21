@@ -1009,7 +1009,7 @@ void Engine::step(double dt) {
 
     // The load is whatever the clutch is holding back: in neutral that is
     // nothing, in gear it is the car.
-    torque += m_drive.step(dt, m_omega);
+    torque += m_drive.step(dt, m_omega, m_p.inertia);
 
     if (m_speedHold) {
         // On the dyno the brake holds the speed and the torque it has to absorb
@@ -1045,14 +1045,32 @@ Snapshot Engine::snapshot() const {
     s.gear             = m_drive.gear();
     s.gearCount        = m_drive.gearCount();
     s.speedKph         = static_cast<float>(m_drive.speedKph());
+    s.clutchPedal      = static_cast<float>(m_drive.clutchPedal());
     s.clutchLock       = static_cast<float>(m_drive.clutchLock());
     s.clutchSlip       = static_cast<float>(m_drive.slip() * 30.0 / kPi);
     s.wheelTorque      = static_cast<float>(m_drive.wheelTorque());
+    s.wheelSlip        = static_cast<float>(m_drive.wheelSlip());
     s.brake            = static_cast<float>(m_drive.brake());
+    s.gearGrind        = static_cast<float>(m_drive.grind());
+    // A stalled engine is one the ignition is on for that is not turning. It is
+    // only reachable now that the clutch is the driver's: before, the coupling
+    // let go on its own long before the crank could be dragged down.
+    s.stalled          = m_ignition && !m_starter && rpm() < 200.0;
     s.crankAngle       = static_cast<float>(m_crankAngle);
     s.peakPressure     = static_cast<float>(m_peakPressure);
-    s.exhaustTemp      = static_cast<float>(m_collectorTemp[0]);
-    s.backPressure     = static_cast<float>(m_collectorPressure[0] * 0.001);
+    // Both readouts are of the exhaust system, not of one pipe of it: on a V
+    // engine bank 0 alone is half the answer, and on an uneven design it is the
+    // wrong half.
+    {
+        double tSum = 0.0, pSum = 0.0;
+        for (std::size_t b = 0; b < m_bankCount; ++b) {
+            tSum += m_collectorTemp[b];
+            pSum += m_collectorPressure[b];
+        }
+        const double n = static_cast<double>(m_bankCount);
+        s.exhaustTemp  = static_cast<float>(tSum / n);
+        s.backPressure = static_cast<float>(pSum / n * 0.001);
+    }
     s.volumetricEff    = static_cast<float>(m_volEff);
     s.residualFraction = static_cast<float>(m_residual);
     s.sparkAdvance     = static_cast<float>(m_sparkAdvance);
