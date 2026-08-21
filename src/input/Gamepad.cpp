@@ -153,14 +153,46 @@ Bindings defaultBindings(int device) {
 }
 
 // ---------------------------------------------------------------------------
+std::vector<Gamepad::DeviceInfo> Gamepad::devices() {
+    sf::Joystick::update();
+    std::vector<DeviceInfo> out;
+    for (int i = 0; i < static_cast<int>(sf::Joystick::Count); ++i) {
+        const auto slot = static_cast<unsigned>(i);
+        if (!sf::Joystick::isConnected(slot)) continue;
+        DeviceInfo d;
+        d.index = i;
+        d.name = sf::Joystick::getIdentification(slot).name.toAnsiString();
+        d.buttons = static_cast<int>(sf::Joystick::getButtonCount(slot));
+        for (int a = 0; a < kAxisCount; ++a)
+            if (sf::Joystick::hasAxis(slot, axisOf(a))) ++d.axes;
+        out.push_back(d);
+    }
+    return out;
+}
+
+void Gamepad::selectDevice(int index) {
+    sf::Joystick::update();
+    sampleRest();
+    adopt(index, true);
+    m_bind.preferredDevice = m_name;
+}
+
 void Gamepad::start() {
     sf::Joystick::update();
     sampleRest();
+
+    // Only build defaults if nothing has been loaded from disk.
+    bool any = false;
+    for (const Binding& x : m_bind.map) any = any || x.bound();
+
+    // The remembered device wins wherever it turns up, and only if it is not
+    // here does slot order get a say.
+    if (!m_bind.preferredDevice.empty()) {
+        for (const DeviceInfo& d : devices())
+            if (d.name == m_bind.preferredDevice) { adopt(d.index, !any); return; }
+    }
     for (int i = 0; i < static_cast<int>(sf::Joystick::Count); ++i) {
         if (sf::Joystick::isConnected(static_cast<unsigned>(i))) {
-            // Only build defaults if nothing has been loaded from disk.
-            bool any = false;
-            for (const Binding& x : m_bind.map) any = any || x.bound();
             adopt(i, !any);
             return;
         }
@@ -197,8 +229,16 @@ void Gamepad::handleEvent(const sf::Event& e) {
         sampleRest();
         // Adopt it if nothing was plugged in; otherwise leave the active device
         // alone, since a second device is usually a shifter or a pedal box that
-        // the bindings can already be pointed at by hand.
-        if (!m_connected) adopt(static_cast<int>(c->joystickId), true);
+        // the bindings can already be pointed at by hand. The one exception is
+        // the device that was asked for by name: if that turns up, it is what
+        // the person meant to drive with.
+        const int slot = static_cast<int>(c->joystickId);
+        const std::string name =
+            sf::Joystick::getIdentification(c->joystickId).name.toAnsiString();
+        if (!m_connected) adopt(slot, true);
+        else if (!m_bind.preferredDevice.empty() && name == m_bind.preferredDevice &&
+                 name != m_name)
+            selectDevice(slot);
     }
     if (const auto* d = e.getIf<sf::Event::JoystickDisconnected>()) {
         if (static_cast<int>(d->joystickId) == m_device) {
@@ -326,6 +366,7 @@ bool saveBindings(const Bindings& b, const std::string& path) {
     std::ofstream out(path, std::ios::trunc);
     if (!out) return false;
     out << "{\n";
+    out << "  \"preferredDevice\": \"" << b.preferredDevice << "\",\n";
     out << "  \"deadzone\": " << b.deadzone << ",\n";
     out << "  \"clutchGamma\": " << b.clutchGamma << ",\n";
     for (int i = 0; i < kControlCount; ++i) {
@@ -361,6 +402,16 @@ bool loadBindings(Bindings& b, const std::string& path) {
     };
 
     Bindings out;
+    {
+        const std::size_t at = text.find("\"preferredDevice\"");
+        if (at != std::string::npos) {
+            const std::size_t colon = text.find(':', at);
+            const std::size_t q1 = colon == std::string::npos ? colon : text.find('"', colon);
+            const std::size_t q2 = q1 == std::string::npos ? q1 : text.find('"', q1 + 1);
+            if (q1 != std::string::npos && q2 != std::string::npos)
+                out.preferredDevice = text.substr(q1 + 1, q2 - q1 - 1);
+        }
+    }
     out.deadzone    = static_cast<float>(valueAfter(0, "deadzone", out.deadzone));
     out.clutchGamma = static_cast<float>(valueAfter(0, "clutchGamma", out.clutchGamma));
 

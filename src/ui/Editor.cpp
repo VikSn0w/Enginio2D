@@ -552,17 +552,45 @@ void Editor::controlsTab(Ui& ui, input::Gamepad& pad, float top) {
 
     ui.column(kColA, top, 640.0f);
     ui.heading("DEVICE");
-    if (pad.connected()) {
-        ui.readout("CONNECTED", pad.deviceName().empty()
-                                    ? ("pad " + std::to_string(pad.device() + 1))
-                                    : pad.deviceName(), pal.good);
-        ui.readout("BUTTONS", std::to_string(pad.buttonCount()));
-        ui.readout("BINDINGS", padLoaded ? "loaded from controls.json"
-                                         : "guessed from the device", pal.dim);
-    } else {
+
+    // Every device that is plugged in, so the one being driven with is a
+    // choice rather than whichever slot Windows happened to hand out first.
+    const std::vector<input::Gamepad::DeviceInfo> devs = input::Gamepad::devices();
+    if (devs.empty()) {
         ui.readout("CONNECTED", "nothing plugged in", pal.dim);
         ui.note("The keyboard drives the car on its own:");
         ui.note("W throttle, DOWN brake, C clutch, S starter.");
+    } else {
+        const float x = ui.columnX();
+        const float w = ui.columnW();
+        for (const input::Gamepad::DeviceInfo& d : devs) {
+            const float y = ui.cursorY();
+            const bool active = pad.connected() && d.index == pad.device();
+            if (ui.button(active ? "DRIVING" : "USE THIS", x, y, 92.0f, 24.0f, active) &&
+                !active) {
+                pad.selectDevice(d.index);
+                // Written out straight away: choosing a device is a decision
+                // about this machine, and having it revert to whatever was on
+                // slot 0 at the next launch is the whole problem being fixed.
+                const bool wrote = input::saveBindings(pad.bindings(),
+                                                       input::bindingsPath());
+                padLoaded = wrote;
+                m_padSaveFlash = wrote ? 2.5f : 0.0f;
+                status("Now driving with " +
+                       (d.name.empty() ? "pad " + std::to_string(d.index + 1) : d.name) +
+                       (wrote ? " - saved" : " - could not save controls.json"));
+            }
+            ui.text(d.name.empty() ? "pad " + std::to_string(d.index + 1) : d.name,
+                    x + 102.0f, y + 4.0f, 13, active ? pal.text : pal.dim);
+            ui.right(std::to_string(d.axes) + " axes, " + std::to_string(d.buttons) +
+                     " buttons", x + w, y + 5.0f, 12, pal.dim);
+            ui.skip(28.0f);
+        }
+        ui.skip(4.0f);
+        ui.note("Switching rebuilds the bindings for that device, since an");
+        ui.note("axis on a throttle quadrant is not one on a thumbstick.");
+        ui.readout("BINDINGS", padLoaded ? "loaded from controls.json"
+                                         : "guessed from the device", pal.dim);
     }
 
     // ---- Bindings -----------------------------------------------------------
@@ -637,9 +665,11 @@ void Editor::controlsTab(Ui& ui, input::Gamepad& pad, float top) {
     if (ui.button("USE DEFAULTS", ui.columnX() + 160.0f, by, 150.0f, 28.0f)) {
         const float dz = pad.bindings().deadzone;
         const float gm = pad.bindings().clutchGamma;
+        const std::string keep = pad.bindings().preferredDevice;
         input::Bindings b = input::defaultBindings(pad.device());
         b.deadzone = dz;
         b.clutchGamma = gm;
+        b.preferredDevice = keep;    // resetting bindings is not changing device
         pad.setBindings(b);
         status("Bindings reset to what the device looks like");
     }

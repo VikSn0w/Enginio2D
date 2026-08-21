@@ -3,6 +3,7 @@
 #include <SFML/Window/Joystick.hpp>
 
 #include <array>
+#include <vector>
 #include <string>
 
 namespace input {
@@ -54,6 +55,12 @@ struct Binding {
 
 struct Bindings {
     std::array<Binding, kControlCount> map{};
+    // Which device the person actually wants to drive with, by name. Slots are
+    // assigned in whatever order Windows enumerated things, so a HOTAS that
+    // happens to be on slot 0 would otherwise claim the engine every time even
+    // though the pad next to it is the one being reached for. Remembering the
+    // name rather than the slot survives replugging and reordering.
+    std::string preferredDevice;
     // Applied at the released end of every axis, which is where the noise is.
     float deadzone = 0.10f;
     // Sticks and triggers are short and abrupt next to a pedal. This stretches
@@ -81,6 +88,21 @@ public:
     bool connected() const { return m_connected; }
     int  device() const    { return m_device; }
     const std::string& deviceName() const { return m_name; }
+
+    // ---- Choosing between devices -------------------------------------------
+    struct DeviceInfo {
+        int         index = -1;
+        std::string name;
+        int         buttons = 0;
+        int         axes = 0;
+    };
+    // Everything currently plugged in, in slot order.
+    static std::vector<DeviceInfo> devices();
+    // Drive with this one from now on. Bindings are rebuilt for it, because a
+    // binding names an axis on a particular device and those do not carry
+    // across from a throttle quadrant to a thumbstick. The feel settings and
+    // the choice itself are remembered.
+    void selectDevice(int index);
 
     float value(Control c) const { return m_value[static_cast<int>(c)]; }
     bool  held(Control c) const  { return m_value[static_cast<int>(c)] > 0.5f; }
